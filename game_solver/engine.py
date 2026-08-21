@@ -13,8 +13,10 @@ from .adb import (
 )
 from .board import ctag, initial_grid, learn_palette, update_grid
 from .config import FRONT_X_N, FRONT_Y_N
-from .models import AnalysisResult, Candidate, FrontNumberCacheEntry
+from .display import ClickMark, SolverDisplay
+from .models import AnalysisResult, Candidate, FrontNumberCacheEntry, TwoStepPlan
 from .monitor import wait_for_parking_idle
+from .ocr import read_number_at
 from .state import load_state, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
@@ -22,7 +24,7 @@ from .strategy import (
 )
 from .unlock import unlock_sixth_slot_at_game_start
 from .vehicles import (
-    _front_number_fingerprint, detect_front_and_next, detect_front_centers,
+    _front_number_fingerprint, car_color_at, detect_front_and_next, detect_front_centers,
     detect_parked, extend_palette_from_front_numbers, parking_roi,
     read_front_numbers_at_centers, read_front_numbers_cached,
 )
@@ -187,10 +189,109 @@ def queue_empty_on_image(image_bgr: np.ndarray, palette: np.ndarray) -> Tuple[bo
         image_rgb, palette, nums, centers
     )
     front, _nxt = detect_front_and_next(
-        image_rgb, image_bgr, palette2, centers, nums
+        image_rgb, image_bgr, palette2, centers, nums,
+        read_next_numbers=False,
     )
     return (len(front) == 0), added
 
+
+
+def wait_for_promoted_next_car(
+    result: AnalysisResult,
+    plan: TwoStepPlan,
+    *,
+    serial: Optional[str],
+    timeout: float,
+    poll_interval: float,
+    initial_delay: float,
+    display: Optional[SolverDisplay] = None,
+) -> Tuple[bool, Optional[np.ndarray], int, int]:
+    """
+    同列第二排计划的毫秒级补位确认。
+
+    不重新分析棋盘，只在预期列的第一排位置检查：
+      - 颜色 == 预测的第二排颜色；
+      - 数字 == 预测的第二排数字。
+
+    两项同时吻合才允许第二次点击。超时只放弃第二步，不会误点。
+    """
+    next_car = next(
+        (
+            c for c in result.nxt
+            if c.column == plan.second.column
+        ),
+        None,
+    )
+    if next_car is None:
+        return False, None, 0, 0
+
+    x = int(round(next_car.x))
+    y = int(round(FRONT_Y_N * result.image_h))
+
+    if initial_delay > 0:
+        time.sleep(initial_delay)
+
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_frame: Optional[np.ndarray] = None
+    last_num: Optional[int] = None
+    last_color: Optional[int] = None
+
+    while True:
+        frame = adb_capture_bgr(serial)
+        last_frame = frame
+        last_num = read_number_at(frame, float(x), float(y))
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32)
+        last_color = car_color_at(
+            rgb,
+            float(x),
+            float(y),
+            result.palette,
+        )
+
+        matched = (
+            last_num == plan.second.capacity
+            and last_color == plan.second.color
+        )
+        if matched:
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="连续两步 · 同列补位确认",
+                    hint=(
+                        f"第{plan.second.column}列第二排已顶上："
+                        f"{ctag(plan.second.color)}×{plan.second.capacity}；"
+                        "颜色和数字均与预测一致，执行第二次点击。"
+                    ),
+                    marks=(ClickMark(x, y, "2"),),
+                )
+            return True, frame, x, y
+
+        if time.monotonic() >= deadline:
+            if display is not None and last_frame is not None:
+                display.show(
+                    last_frame,
+                    stage="连续两步 · 第二步取消",
+                    hint=(
+                        f"补位确认超时：期望 {ctag(plan.second.color)}×"
+                        f"{plan.second.capacity}，实际颜色="
+                        f"{ctag(last_color) if last_color is not None else 'UNKNOWN'}，"
+                        f"数字={last_num if last_num is not None else 'UNKNOWN'}。"
+                        "只保留第一步，进入正常分流监控。"
+                    ),
+                )
+            return False, last_frame, x, y
+
+        if display is not None:
+            display.show(
+                frame,
+                stage="连续两步 · 等待同列补位",
+                hint=(
+                    f"等待第{plan.second.column}列第二排 "
+                    f"{ctag(plan.second.color)}×{plan.second.capacity} "
+                    "进入第一排；不会在未确认时盲点。"
+                ),
+            )
+        time.sleep(max(0.02, poll_interval))
 
 
 def tap_candidate_from_result(
@@ -261,6 +362,23 @@ def run_manual_step_mode(args: argparse.Namespace) -> int:
 
 
 def run_auto_flow_mode(args: argparse.Namespace) -> int:
+    display = SolverDisplay(
+        enabled=not args.no_display,
+        max_width=args.display_width,
+        max_height=args.display_height,
+    )
+    display.start()
+
+    try:
+        return _run_auto_flow_mode_impl(args, display)
+    finally:
+        display.close()
+
+
+def _run_auto_flow_mode_impl(
+    args: argparse.Namespace,
+    display: SolverDisplay,
+) -> int:
     reset_current = args.reset
     round_no = 0
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
@@ -276,6 +394,7 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
             serial=args.serial,
             shots_dir=args.shots_dir,
             min_watch_seconds=args.unlock_ad_wait,
+            display=display,
         )
         if did_unlock and args.unlock_return_settle_delay > 0:
             time.sleep(args.unlock_return_settle_delay)
@@ -299,6 +418,13 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
         shot = args.shots_dir / f"analysis_{shot_stamp()}.png"
         adb_screencap(shot, args.serial)
         print(f"分析截图: {shot}")
+        analysis_bgr = cv2.imread(str(shot), cv2.IMREAD_COLOR)
+        if analysis_bgr is not None:
+            display.show(
+                analysis_bgr,
+                stage=f"自动轮次 {round_no} · 正在分析",
+                hint="正在识别棋盘、排队车辆、停车车辆并计算安全候选。",
+            )
 
         result = analyze_image(
             shot, args.state,
@@ -316,6 +442,15 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
 
         # 胜利判定按用户规则：排队区没有车辆。为防补位动画中间的空帧，连续确认两次。
         if len(result.front) == 0 and len(result.nxt) == 0:
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="胜利确认",
+                    hint=(
+                        "排队区第一次检测为空；"
+                        f"等待 {args.queue_empty_confirm_delay:.1f}s 再确认一次。"
+                    ),
+                )
             print(f"排队区第一次检测为空，等待 {args.queue_empty_confirm_delay:.1f}s 再确认一次...")
             time.sleep(args.queue_empty_confirm_delay)
             confirm_bgr = adb_capture_bgr(args.serial)
@@ -323,8 +458,19 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
             confirm_path = args.shots_dir / f"queue_confirm_{shot_stamp()}.png"
             save_bgr(confirm_path, confirm_bgr)
             if empty2:
+                display.show(
+                    confirm_bgr,
+                    stage="本局完成",
+                    hint="排队区连续两次无车辆；判定本局结束。",
+                )
                 print(f"排队区连续两次无车辆，判定本局结束。确认截图: {confirm_path}")
                 return 0
+
+            display.show(
+                confirm_bgr,
+                stage="胜利确认取消",
+                hint="第二次重新检测到排队车辆；刚才只是补位动画，重新分析。",
+            )
             print("第二次检测到排队车辆，说明刚才处于补位动画；旧建议作废，下一轮重新截图分析。")
             if args.analysis_settle_delay > 0:
                 time.sleep(args.analysis_settle_delay)
@@ -335,6 +481,12 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
             return 0
 
         if result.best is None:
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="安全暂停",
+                    hint="当前没有通过硬安全约束的候选动作；未执行点击。",
+                )
             print("自动流程暂停：当前没有通过硬安全约束的候选动作。")
             return 0
 
@@ -344,6 +496,52 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
         plan = result.two_step_plan
 
         if plan is not None and (args.slots - result.occupied_slots) >= 3:
+            first_car = next(
+                c for c in result.front
+                if c.column == plan.first.column
+            )
+
+            if plan.second_source == "next":
+                second_visual_car = next(
+                    c for c in result.nxt
+                    if c.column == plan.second.column
+                )
+                second_label = "2 NEXT"
+                second_hint = (
+                    f"第{plan.second.column}列第二排 "
+                    f"{ctag(plan.second.color)}×{plan.second.capacity}；"
+                    "第一步后顶到第一排，快速确认再点击。"
+                )
+            else:
+                second_visual_car = next(
+                    c for c in result.front
+                    if c.column == plan.second.column
+                )
+                second_label = "2"
+                second_hint = (
+                    f"当前第一排第{plan.second.column}列 "
+                    f"{ctag(plan.second.color)}×{plan.second.capacity}。"
+                )
+
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="执行连续两步",
+                    hint=(
+                        f"第1步：第{plan.first.column}列 "
+                        f"{ctag(plan.first.color)}×{plan.first.capacity}；"
+                        f"第2步：{second_hint} 两次点击后只做一次完整分流监控。"
+                    ),
+                    marks=(
+                        ClickMark(int(round(first_car.x)), int(round(first_car.y)), "1"),
+                        ClickMark(
+                            int(round(second_visual_car.x)),
+                            int(round(second_visual_car.y)),
+                            second_label,
+                        ),
+                    ),
+                )
+
             x1, y1 = tap_candidate_from_result(
                 result,
                 serial=args.serial,
@@ -355,23 +553,70 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
                 f"坐标=({x1}, {y1})"
             )
 
-            if args.double_step_gap > 0:
-                time.sleep(args.double_step_gap)
+            second_executed = False
 
-            x2, y2 = tap_candidate_from_result(
-                result,
-                serial=args.serial,
-                candidate=plan.second,
-            )
-            print(
-                f"连续两步 2/2: 第 {plan.second.column} 列 "
-                f"{ctag(plan.second.color)}×{plan.second.capacity}，"
-                f"坐标=({x2}, {y2})"
-            )
-            print(
-                "两步已连续执行；现在只做一次停车数字分流监控。"
-            )
+            if plan.second_source == "next":
+                ok, _confirm_frame, x2, y2 = wait_for_promoted_next_car(
+                    result,
+                    plan,
+                    serial=args.serial,
+                    timeout=args.queue_promote_timeout,
+                    poll_interval=args.queue_promote_poll_interval,
+                    initial_delay=args.double_step_gap,
+                    display=display,
+                )
+                if ok:
+                    adb_tap(x2, y2, args.serial)
+                    second_executed = True
+                    print(
+                        f"连续两步 2/2: 同列补位确认通过，第 {plan.second.column} 列 "
+                        f"{ctag(plan.second.color)}×{plan.second.capacity}，"
+                        f"坐标=({x2}, {y2})"
+                    )
+                else:
+                    print(
+                        "连续两步第二步取消：同列补位在限定时间内未通过颜色+数字确认；"
+                        "不会盲点，直接监控第一步产生的分流。"
+                    )
+            else:
+                if args.double_step_gap > 0:
+                    time.sleep(args.double_step_gap)
+                x2, y2 = tap_candidate_from_result(
+                    result,
+                    serial=args.serial,
+                    candidate=plan.second,
+                )
+                second_executed = True
+                print(
+                    f"连续两步 2/2: 第 {plan.second.column} 列 "
+                    f"{ctag(plan.second.color)}×{plan.second.capacity}，"
+                    f"坐标=({x2}, {y2})"
+                )
+
+            if second_executed:
+                print("两步已连续执行；现在只做一次停车数字分流监控。")
         else:
+            target_car = next(
+                c for c in result.front
+                if c.column == result.best.column
+            )
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="执行点击",
+                    hint=(
+                        f"点击第{result.best.column}列 "
+                        f"{ctag(result.best.color)}×{result.best.capacity}"
+                    ),
+                    marks=(
+                        ClickMark(
+                            int(round(target_car.x)),
+                            int(round(target_car.y)),
+                            "CLICK",
+                        ),
+                    ),
+                )
+
             x, y = tap_candidate_from_result(
                 result,
                 serial=args.serial,
@@ -382,6 +627,16 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
                 f"坐标=({x}, {y})"
             )
 
+        if analysis_bgr is not None:
+            display.show(
+                analysis_bgr,
+                stage="等待分流启动",
+                hint=(
+                    f"点击已完成；等待 {args.flow_start_delay:.1f}s "
+                    "后建立停车数字监控基准。"
+                ),
+            )
+
         monitor_end = wait_for_parking_idle(
             shots_dir=args.shots_dir,
             serial=args.serial,
@@ -390,6 +645,7 @@ def run_auto_flow_mode(args: argparse.Namespace) -> int:
             idle_timeout=args.parking_idle_timeout,
             max_failures=args.monitor_max_failures,
             empty_settle_delay=args.empty_settle_delay,
+            display=display,
         )
         print(f"本轮停车监控结束: {monitor_end}")
 

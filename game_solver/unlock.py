@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import cv2
 import numpy as np
@@ -35,6 +35,9 @@ from .config import (
     UNLOCK_BUTTON_MAX_ASPECT,
 )
 from .vehicles import detect_front_centers
+
+if TYPE_CHECKING:
+    from .display import SolverDisplay
 
 
 # 点击解锁后广告页面可能需要几秒才真正切换。
@@ -158,6 +161,7 @@ def unlock_sixth_slot_at_game_start(
     serial: Optional[str],
     shots_dir: Path,
     min_watch_seconds: float = UNLOCK_AD_MIN_WATCH_SECONDS,
+    display: Optional["SolverDisplay"] = None,
 ) -> bool:
     """
     每局开始时自动领取广告解锁的第6停车位。
@@ -189,11 +193,27 @@ def unlock_sixth_slot_at_game_start(
 
     unlock_center = _find_unlock_button_center(before)
     if unlock_center is None:
+        if display is not None:
+            display.show(
+                before,
+                stage="启动检查",
+                hint="未检测到【解锁】按钮；第6停车位视为已经可用。",
+            )
         print("启动检查：当前画面没有检测到【解锁】按钮，视为第6停车位已经可用。")
         return False
 
     start_time = time.monotonic()
     ux, uy = unlock_center
+
+    if display is not None:
+        from .display import ClickMark
+        display.show(
+            before,
+            stage="启动检查 · 解锁第6停车位",
+            hint="检测到【解锁】按钮，准备点击并进入广告。",
+            marks=(ClickMark(ux, uy, "UNLOCK"),),
+        )
+
     adb_tap(ux, uy, serial)
     print(f"检测到【解锁】按钮并点击，坐标=({ux}, {uy})")
 
@@ -208,6 +228,18 @@ def unlock_sixth_slot_at_game_start(
 
     while still_unlock is not None and time.monotonic() < open_deadline:
         elapsed_open = time.monotonic() - start_time
+        if display is not None:
+            from .display import ClickMark
+            sx, sy = still_unlock
+            display.show(
+                after_open,
+                stage="广告切换中",
+                hint=(
+                    f"已点击解锁 {elapsed_open:.1f}s；"
+                    "等待【解锁】按钮消失，确认广告开始。"
+                ),
+                marks=(ClickMark(sx, sy, "WAIT"),),
+            )
         remain_open = max(0.0, open_deadline - time.monotonic())
         print(
             f"\r广告正在切换，解锁按钮暂时仍可见："
@@ -233,6 +265,13 @@ def unlock_sixth_slot_at_game_start(
     print()
     print("检测到【解锁】按钮已经消失，确认广告流程开始。")
 
+    if display is not None:
+        display.show(
+            after_open,
+            stage="广告播放中",
+            hint=f"广告已开始；至少观看 {min_watch_seconds:.1f}s 后自动关闭。",
+        )
+
     elapsed = time.monotonic() - start_time
     remaining = max(0.0, min_watch_seconds - elapsed)
     if remaining > 0:
@@ -243,6 +282,18 @@ def unlock_sixth_slot_at_game_start(
         time.sleep(remaining)
 
     current = adb_capture_bgr(serial)
+    h, w = current.shape[:2]
+    cx_preview = int(round(AD_CLOSE_X_N * w))
+    cy_preview = int(round(AD_CLOSE_Y_N * h))
+    if display is not None:
+        from .display import ClickMark
+        display.show(
+            current,
+            stage="广告关闭",
+            hint="广告时间已到，点击右上角关闭按钮。",
+            marks=(ClickMark(cx_preview, cy_preview, "CLOSE"),),
+        )
+
     cx, cy = _tap_normalized(
         current,
         AD_CLOSE_X_N,
@@ -256,6 +307,12 @@ def unlock_sixth_slot_at_game_start(
 
     returned = adb_capture_bgr(serial)
     if _looks_like_game_screen(returned):
+        if display is not None:
+            display.show(
+                returned,
+                stage="解锁完成",
+                hint="广告已关闭并返回游戏；准备开始自动分析。",
+            )
         print("第6停车位广告解锁完成，已返回游戏。")
         return True
 
@@ -267,6 +324,12 @@ def unlock_sixth_slot_at_game_start(
 
         current = adb_capture_bgr(serial)
         if _looks_like_game_screen(current):
+            if display is not None:
+                display.show(
+                    current,
+                    stage="解锁完成",
+                    hint="广告已关闭并返回游戏；准备开始自动分析。",
+                )
             print("第6停车位广告解锁完成，已返回游戏。")
             return True
 
@@ -286,6 +349,12 @@ def unlock_sixth_slot_at_game_start(
 
         returned = adb_capture_bgr(serial)
         if _looks_like_game_screen(returned):
+            if display is not None:
+                display.show(
+                    returned,
+                    stage="解锁完成",
+                    hint="广告已关闭并返回游戏；准备开始自动分析。",
+                )
             print("第6停车位广告解锁完成，已返回游戏。")
             return True
 

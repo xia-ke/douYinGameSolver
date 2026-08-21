@@ -25,6 +25,8 @@ def main() -> int:
     parser.add_argument("--manual-step", action="store_true", help="人工逐步调试模式")
     parser.add_argument("--tap-delay", type=float, default=0.35, help="分析结束到点击之间等待秒数，默认 0.35")
     parser.add_argument("--double-step-gap", type=float, default=0.35, help="停车空位>=3时连续两步之间的点击间隔，默认 0.35 秒")
+    parser.add_argument("--queue-promote-timeout", type=float, default=1.6, help="同列第二排顶到第一排的快速确认最长等待，默认 1.6 秒")
+    parser.add_argument("--queue-promote-poll-interval", type=float, default=0.12, help="同列补位确认轮询间隔，默认 0.12 秒")
     parser.add_argument("--flow-start-delay", type=float, default=2.5, help="点击后多久建立停车数字监控基准，默认 2.5 秒")
     parser.add_argument("--parking-check-interval", type=float, default=1.0, help="停车数字区域检查间隔，默认 1 秒")
     parser.add_argument("--parking-idle-timeout", type=float, default=8.0, help="停车数字连续无变化多久算分流结束，默认 20 秒")
@@ -32,8 +34,11 @@ def main() -> int:
     parser.add_argument("--empty-settle-delay", type=float, default=0.5, help="停车数字单帧为空后的连续确认间隔，默认 0.5 秒")
     parser.add_argument("--queue-empty-confirm-delay", type=float, default=0.5, help="排队区判空后的第二次确认间隔，默认 0.5 秒")
     parser.add_argument("--analysis-settle-delay", type=float, default=0.35, help="停车监控结束到下一轮重新截图前的收尾等待，默认 0.35 秒")
+    parser.add_argument("--no-display", action="store_true", help="关闭运行状态展示窗口")
+    parser.add_argument("--display-width", type=int, default=620, help="展示窗口最大宽度，默认 620")
+    parser.add_argument("--display-height", type=int, default=980, help="展示窗口最大高度，默认 980")
     parser.add_argument("--skip-sixth-slot-unlock", action="store_true", help="新局时跳过广告解锁第6停车位")
-    parser.add_argument("--unlock-ad-wait", type=float, default=15.5, help="点击解锁后至少等待多久再关闭广告，默认 15.5 秒")
+    parser.add_argument("--unlock-ad-wait", type=float, default=20, help="点击解锁后至少等待多久再关闭广告，默认 15.5 秒")
     parser.add_argument("--unlock-return-settle-delay", type=float, default=1.0, help="广告关闭返回游戏后再等待多久开始分析，默认 1 秒")
     # 兼容旧版本命令行；纯数字监控模式下该参数不再使用。
     parser.add_argument("--transition-timeout", type=float, default=None, help=argparse.SUPPRESS)
@@ -41,15 +46,21 @@ def main() -> int:
 
     if args.slots < 1:
         parser.error("--slots 必须 >= 1")
-    for name in ("tap_delay", "double_step_gap", "flow_start_delay", "empty_settle_delay", "queue_empty_confirm_delay", "analysis_settle_delay", "unlock_ad_wait", "unlock_return_settle_delay"):
+    for name in ("tap_delay", "double_step_gap", "queue_promote_timeout", "flow_start_delay", "empty_settle_delay", "queue_empty_confirm_delay", "analysis_settle_delay", "unlock_ad_wait", "unlock_return_settle_delay"):
         if getattr(args, name) < 0:
             parser.error(f"--{name.replace('_', '-')} 必须 >= 0")
+    if args.queue_promote_poll_interval <= 0:
+        parser.error("--queue-promote-poll-interval 必须 > 0")
     if args.parking_check_interval <= 0:
         parser.error("--parking-check-interval 必须 > 0")
     if args.parking_idle_timeout <= 0:
         parser.error("--parking-idle-timeout 必须 > 0")
     if args.monitor_max_failures < 1:
         parser.error("--monitor-max-failures 必须 >= 1")
+    if args.display_width < 320:
+        parser.error("--display-width 必须 >= 320")
+    if args.display_height < 480:
+        parser.error("--display-height 必须 >= 480")
 
     try:
         if args.image:

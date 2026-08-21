@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import base64
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -385,6 +386,239 @@ def _read_one_or_two_digit_number(crop_bgr: np.ndarray) -> Tuple[Optional[int], 
 # 兼容旧内部名字。
 def _read_two_digit_number(crop_bgr: np.ndarray) -> Tuple[Optional[int], float]:
     return _read_one_or_two_digit_number(crop_bgr)
+
+
+# 游戏第二排车辆的数字使用低对比度/半透明样式。
+# 下面的 32x48 二值原型来自同一游戏字体的真实数字形状；只保存字形，不保存截图。
+_PREVIEW_GAME_DIGIT_B64 = {
+    0: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/4AAAP+AAAf/4AAf//gAP//8AD///gB///4Af///AP///wD///+A////g////4P///+D////g////4P////D////w////8P////D////w////8P////D////w////4P///+D////g////4D///+A////gP///wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    1: "AAAAAAAAAAAAB//gAAf/4AP///gD///4D///+D////w////8P////D////w////8P////D////w////8P////D////wMB//8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAB//wAAf/8AAH//AAAAAAAAAAA",
+    2: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/AAAD/wAAP//wAH///AB///4Af///AH///4B///+Af///gH///8AwD//AAAP/wAAB/8AAAf/AAAP/gAAD/4AAA/+AAA//gAAf/wAAP/8AAH/+AAD//AAB//gAA//wAAf/4AAP/8AAP/+AAH//AAD//gAD//4AA////4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    3: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAH/4AAB/+AAB//8AA///4AP///AD///4A////AP///wD///8A////gGA//4AAH/+AAA//gAAP/4AAD/+AAB//AAB//wAf//4AP//8AD///AA///gAP//4AD///AA///4AH///AAH//4AAD/+AAAP/wAAD/8AAA//AAAP/wAAP/8CAP//D////gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    4: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB/4AAA//AAAP/wAAH/8AAD//AAA//wAAf/8AAH//AAD//wAB//8AA///AAP//wAH//8AD///AA///wAf//8AP///AD///wB///8Af///gH///+B////wf///8P////D////w////8H////B////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    5: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP//+AD///gB///8Af///AH///wD///8A////AP///wD///8A///+AP/gAAD/gAAA/4AAAP+AAAD/4AAD///AA///8AP///4D///+A////wP///+D////g////8P////A/n//wAAH/8AAA//AAAP/wAAD/8AAA//AAAf/wAAP/8DAf//D////wAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    6: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAD8AAAA/AAAD/4AAD/+AAD//gAB//4AA//+AAf//gAP//wAD/8AAB/4AAAf8AAAP+AAAD/gAAA/4AAAP//8AD///wD///+A////wP///+D////g////4P////D////w////8P////D////w////8P////D////wP///4D///+Af///gH///wA///4AH//8AAf/+AAB/8AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    7: "AAAAAAAAAAAAAAAAD///+A////g////8P////D////w////8P////D////w////8D////AAAP/wAAA/8AAAP/AAAP/wAAD/4AAB/+AAAf/AAAP/wAAD/8AAA/+AAAf/gAAH/wAAB/8AAB//AAAf/wAAH/wAAD/8AAA/+AAAf/gAAH/wAAB/8AAA//AAAP/gAAD/4AAB/+AAAf/AAAH/wAAH/8AAB/8AAA//AAAH/gAAAAAAAAAAAAAAAAAAAAAAA",
+    8: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB/8AAAf/AAA//8AAf//wAP//+AH///wD///8A////gP///4P///+D////g////4D///+A////gP///wD///8Af//+AD///AA///wAP//8AH///gD///8D////g////4P////D////w////8P////D////w////8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    9: "AAAAAAAAAAAAAAAAAAAAAAABwAAAAcAAAH//AAD//4AD///AB///4Af///AP///4D///+A////g////8P////D////w////8P////D////w////8P////A////wP///8B////Af///wD///8Af///AB///gAAA/4AAAP+AAAD/gAAB/4AAA/8AAP//AAf//gAP//4AD//8AA//+AAP/+AAD/+AAA/+AAAHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+}
+_PREVIEW_GAME_BANK_CACHE: Optional[np.ndarray] = None
+
+
+def _preview_game_bank() -> np.ndarray:
+    global _PREVIEW_GAME_BANK_CACHE
+    if _PREVIEW_GAME_BANK_CACHE is not None:
+        return _PREVIEW_GAME_BANK_CACHE
+
+    rows: List[np.ndarray] = []
+    for digit in range(10):
+        packed = np.frombuffer(
+            base64.b64decode(_PREVIEW_GAME_DIGIT_B64[digit]),
+            dtype=np.uint8,
+        )
+        bits = np.unpackbits(packed)[: 32 * 48].reshape(48, 32)
+        rows.append(bits.astype(np.float32).reshape(-1))
+    _PREVIEW_GAME_BANK_CACHE = np.stack(rows, axis=0)
+    return _PREVIEW_GAME_BANK_CACHE
+
+
+def _fill_external_contours(mask: np.ndarray) -> np.ndarray:
+    """把低对比度数字的轮廓/半填充统一成实心字形。"""
+    m = (mask > 0).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = np.zeros_like(m)
+    if contours:
+        cv2.drawContours(out, contours, -1, 255, cv2.FILLED)
+    return (out > 0).astype(np.uint8)
+
+
+def _extract_preview_digit_masks(crop_bgr: np.ndarray) -> List[np.ndarray]:
+    """
+    提取第二排浅色数字。
+
+    彩色车：数字半透明后饱和度明显低于车身；
+    白色车：饱和度本身很低，改用亮度下降提取灰色数字轮廓。
+    识别不够可靠时宁可返回空，不参与二层安全预测。
+    """
+    if crop_bgr.size == 0:
+        return []
+
+    hsv = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    med_sat = float(np.median(sat))
+    med_val = float(np.median(val))
+
+    if med_sat < 45.0:
+        raw = (val < med_val - 35.0).astype(np.uint8) * 255
+    else:
+        raw = ((sat < med_sat - 18.0) & (val > 60)).astype(np.uint8) * 255
+
+    raw = cv2.medianBlur(raw, 3)
+    n, labels, stats, _centroids = cv2.connectedComponentsWithStats(raw, 8)
+    H, W = raw.shape
+
+    comps: List[Tuple[int, int, int, int, int, int]] = []
+    for label_id in range(1, n):
+        x, y, w, h, area = map(int, stats[label_id])
+        if x <= 2 or x + w >= W - 2:
+            continue
+        if y < int(H * 0.42):
+            continue
+        if not (8 <= w <= 38 and 18 <= h <= 40 and area >= 50):
+            continue
+        if w / max(1.0, float(h)) > 1.45:
+            continue
+        comps.append((x, y, w, h, area, label_id))
+
+    if not comps:
+        return []
+
+    comps.sort(key=lambda item: item[0])
+
+    if len(comps) > 2:
+        pairs: List[Tuple[float, Tuple[int, ...], Tuple[int, ...]]] = []
+        for ai in range(len(comps)):
+            for bi in range(ai + 1, len(comps)):
+                a, b = comps[ai], comps[bi]
+                gap = b[0] - (a[0] + a[2])
+                if gap < -3 or gap > 25:
+                    continue
+                hsim = min(a[3], b[3]) / max(1.0, float(max(a[3], b[3])))
+                yoff = abs((a[1] + a[3] / 2.0) - (b[1] + b[3] / 2.0))
+                span = b[0] + b[2] - a[0]
+                center = (a[0] + b[0] + b[2]) / 2.0
+                score = (
+                    5.0 * hsim
+                    - 0.15 * yoff
+                    - 0.04 * abs(span - 58.0)
+                    - 0.06 * abs(center - W / 2.0)
+                )
+                pairs.append((score, a, b))
+        if pairs:
+            _score, a, b = max(pairs, key=lambda item: item[0])
+            comps = [a, b]
+
+    comps = comps[:2]
+    masks: List[np.ndarray] = []
+    for x, y, w, h, _area, label_id in comps:
+        digit = (labels[y:y + h, x:x + w] == label_id).astype(np.uint8)
+        masks.append(_fill_external_contours(digit))
+    return masks
+
+
+def _recognize_preview_digit(mask: np.ndarray) -> Tuple[Optional[int], float, float]:
+    normalized = _normalize_digit_mask(mask)
+    v0 = (normalized > 0).astype(np.float32)
+    if float(v0.sum()) <= 0:
+        return None, 0.0, 0.0
+
+    bank = _preview_game_bank()
+    areas = bank.sum(axis=1)
+    best = np.full(10, -1e9, dtype=np.float32)
+
+    # 只允许 ±1px；实际游戏字体模板已经同源，不需要慢速 ±2 穷举。
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            shifted = np.zeros_like(v0)
+            ys0 = max(0, -dy)
+            ys1 = min(v0.shape[0], v0.shape[0] - dy)
+            xs0 = max(0, -dx)
+            xs1 = min(v0.shape[1], v0.shape[1] - dx)
+            yd0 = max(0, dy)
+            yd1 = yd0 + (ys1 - ys0)
+            xd0 = max(0, dx)
+            xd1 = xd0 + (xs1 - xs0)
+            if ys1 <= ys0 or xs1 <= xs0:
+                continue
+            shifted[yd0:yd1, xd0:xd1] = v0[ys0:ys1, xs0:xs1]
+            v = shifted.reshape(-1)
+            inter = bank @ v
+            dice = 2.0 * inter / np.maximum(1.0, areas + float(v.sum()))
+            best = np.maximum(best, dice)
+
+    ranked = np.argsort(best)[::-1]
+    digit = int(ranked[0])
+    score = float(best[digit])
+    second = float(best[int(ranked[1])])
+    margin = score - second
+
+    # 低对比度 OCR 只用于策略前瞻，阈值宁可保守。
+    if not (
+        (score >= 0.80 and margin >= 0.025)
+        or (score >= 0.72 and margin >= 0.060)
+    ):
+        return None, score, margin
+    return digit, score, margin
+
+
+def _read_preview_number_from_crop(crop_bgr: np.ndarray) -> Tuple[Optional[int], float]:
+    masks = _extract_preview_digit_masks(crop_bgr)
+    if len(masks) not in (1, 2):
+        return None, 0.0
+
+    digits: List[int] = []
+    confidences: List[float] = []
+    for mask in masks:
+        digit, score, margin = _recognize_preview_digit(mask)
+        if digit is None:
+            return None, 0.0
+        digits.append(digit)
+        confidences.append(score + min(0.12, max(0.0, margin)))
+
+    if len(digits) == 1:
+        if digits[0] == 0:
+            return None, 0.0
+        return digits[0], float(min(confidences))
+
+    if digits[0] == 0:
+        return None, 0.0
+    return digits[0] * 10 + digits[1], float(min(confidences))
+
+
+def read_preview_number_at(
+    image_bgr: np.ndarray,
+    cx: float,
+    cy: float,
+    scale_hint: float = 1.0,
+) -> Optional[int]:
+    """读取第二排浅色的 1~2 位车辆数字。"""
+    h, w = image_bgr.shape[:2]
+    sx = (w / REF_W) * scale_hint
+    sy = (h / REF_H) * scale_hint
+    votes: List[Tuple[int, float]] = []
+
+    for top, bottom, half in (
+        (90, 8, 50),
+        (86, 10, 48),
+        (94, 6, 52),
+    ):
+        x1 = max(0, int(cx - half * sx))
+        x2 = min(w, int(cx + half * sx))
+        y1 = max(0, int(cy - top * sy))
+        y2 = min(h, int(cy - bottom * sy))
+        value, confidence = _read_preview_number_from_crop(image_bgr[y1:y2, x1:x2])
+        if value is not None and 1 <= value <= 99:
+            votes.append((int(value), float(confidence)))
+
+    if not votes:
+        return None
+
+    grouped: Dict[int, List[float]] = defaultdict(list)
+    for value, confidence in votes:
+        grouped[value].append(confidence)
+
+    ranked = sorted(
+        grouped.items(),
+        key=lambda kv: (len(kv[1]), sum(kv[1]) / len(kv[1])),
+        reverse=True,
+    )
+    value, confs = ranked[0]
+    if len(confs) >= 2:
+        return int(value)
+    if confs and confs[0] >= 0.88:
+        return int(value)
+    return None
 
 
 def read_number_at(image_bgr: np.ndarray, cx: float, cy: float, scale_hint: float = 1.0) -> Optional[int]:

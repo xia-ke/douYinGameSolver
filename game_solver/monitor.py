@@ -3,12 +3,15 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import cv2
 import numpy as np
 
 from .adb import adb_capture_bgr, save_bgr, shot_stamp
+
+if TYPE_CHECKING:
+    from .display import SolverDisplay
 from .config import (
     REF_W, REF_H,
     RAW_MONITOR_X1_N, RAW_MONITOR_X2_N,
@@ -161,6 +164,7 @@ def confirm_parking_digit_area_empty(
     *,
     serial: Optional[str],
     confirm_delay: float,
+    display: Optional["SolverDisplay"] = None,
 ) -> Tuple[bool, np.ndarray, str]:
     last = first_frame
 
@@ -170,6 +174,19 @@ def confirm_parking_digit_area_empty(
 
         last = adb_capture_bgr(serial)
         state, reason = parking_digit_monitor_state(last)
+
+        if display is not None:
+            hint = (
+                f"停车数字为空确认 {i+2}/"
+                f"{1 + RAW_MONITOR_EMPTY_CONFIRM_EXTRA_FRAMES}"
+            )
+            if state is not None and state.glyph_count > 0:
+                hint += "：重新检测到数字，继续监控"
+            display.show(
+                last,
+                stage="分流监控 · 空停车区确认",
+                hint=hint,
+            )
 
         if state is None:
             return False, last, f"第{i+2}次空数字确认失败: {reason}"
@@ -194,6 +211,7 @@ def wait_for_parking_idle(
     idle_timeout: float,
     max_failures: int,
     empty_settle_delay: float,
+    display: Optional["SolverDisplay"] = None,
 ) -> Path:
     """
     点击后只看停车数字像素有没有变化。
@@ -218,6 +236,12 @@ def wait_for_parking_idle(
         now = time.monotonic()
 
         if current is None:
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="分流监控 · 识别失败",
+                    hint=f"停车数字像素识别失败：{reason}",
+                )
             failures += 1
             last_activity = now
             print(
@@ -239,12 +263,26 @@ def wait_for_parking_idle(
         failures = 0
 
         if current.glyph_count == 0:
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="分流监控 · 暂未检测到停车数字",
+                    hint="正在连续多帧确认是否确实为空。",
+                )
+
             ok, confirm_frame, why = confirm_parking_digit_area_empty(
                 frame,
                 serial=serial,
                 confirm_delay=empty_settle_delay,
+                display=display,
             )
             if ok:
+                if display is not None:
+                    display.show(
+                        confirm_frame,
+                        stage="分流结束",
+                        hint=f"{why}；准备进入下一轮重新截图分析。",
+                    )
                 print()
                 monitor_end = shots_dir / f"monitor_end_no_digits_{shot_stamp()}.png"
                 save_bgr(monitor_end, confirm_frame)
@@ -257,6 +295,12 @@ def wait_for_parking_idle(
             print(
                 f"\n停车数字区域单帧为空，但未通过连续确认：{why}。继续监控。"
             )
+            if display is not None:
+                display.show(
+                    confirm_frame,
+                    stage="分流监控 · 继续",
+                    hint=f"空状态未确认：{why}",
+                )
             confirm_state, _ = parking_digit_monitor_state(confirm_frame)
             previous = confirm_state
             last_activity = time.monotonic()
@@ -267,6 +311,12 @@ def wait_for_parking_idle(
         if previous is None:
             previous = current
             last_activity = now
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="分流监控 · 建立基准",
+                    hint=format_digit_monitor_state(current),
+                )
             print()
             print(f"停车数字像素监控基准: {format_digit_monitor_state(current)}")
             if check_interval > 0:
@@ -276,6 +326,15 @@ def wait_for_parking_idle(
         changed, ratio = parking_digit_mask_changed(previous, current)
 
         if changed:
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="分流监控 · 检测到变化",
+                    hint=(
+                        f"停车数字像素发生变化，静止计时重置。"
+                        f" change={ratio:.4f}"
+                    ),
+                )
             print()
             print(
                 "检测到停车数字像素变化: "
@@ -290,6 +349,16 @@ def wait_for_parking_idle(
 
             idle_for = now - last_activity
             remain = max(0.0, idle_timeout - idle_for)
+            if display is not None:
+                display.show(
+                    frame,
+                    stage="分流监控 · 等待稳定",
+                    hint=(
+                        f"停车数字像素无变化 {idle_for:.1f}s / "
+                        f"{idle_timeout:.1f}s；还需 {remain:.1f}s。"
+                    ),
+                )
+
             print(
                 f"\r停车数字像素无变化 {idle_for:5.1f}s / {idle_timeout:.1f}s "
                 f"(还需 {remain:4.1f}s) "
@@ -300,6 +369,15 @@ def wait_for_parking_idle(
             )
 
             if idle_for >= idle_timeout:
+                if display is not None:
+                    display.show(
+                        frame,
+                        stage="分流结束",
+                        hint=(
+                            f"连续 {idle_timeout:.1f}s 停车数字像素无变化；"
+                            "准备进入下一轮重新截图分析。"
+                        ),
+                    )
                 print()
                 monitor_end = shots_dir / f"monitor_end_digits_stable_{shot_stamp()}.png"
                 save_bgr(monitor_end, frame)

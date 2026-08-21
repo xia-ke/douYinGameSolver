@@ -1,6 +1,3 @@
-
-
-
 from __future__ import annotations
 
 from collections import Counter
@@ -12,7 +9,10 @@ import numpy as np
 
 from .config import *
 from .models import Car, FrontNumberCacheEntry
-from .ocr import _recognize_digit, _recognize_digit_fast_only, read_number_at
+from .ocr import (
+    _recognize_digit, _recognize_digit_fast_only,
+    read_number_at, read_preview_number_at,
+)
 
 @dataclass
 class ParkingDigitComponent:
@@ -231,6 +231,19 @@ def read_front_numbers_at_centers(
     return out
 
 
+def read_preview_numbers_at_centers(
+    image_bgr: np.ndarray,
+    centers_x: Sequence[float],
+) -> Dict[int, Optional[int]]:
+    """读取第二排浅色车辆数字；低置信度返回 None。"""
+    h, _w = image_bgr.shape[:2]
+    cy = NEXT_Y_N * h
+    out: Dict[int, Optional[int]] = {}
+    for i, cx in enumerate(centers_x, 1):
+        out[i] = read_preview_number_at(image_bgr, float(cx), cy)
+    return out
+
+
 def _front_number_fingerprint(image_bgr: np.ndarray, cx: float, cy: float) -> np.ndarray:
     """
     固定位置提取第一排数字区域的白色像素指纹。
@@ -354,10 +367,15 @@ def detect_front_and_next(
     palette: np.ndarray,
     centers_x: Sequence[float],
     front_numbers: Optional[Dict[int, Optional[int]]] = None,
+    *,
+    read_next_numbers: bool = True,
 ) -> Tuple[List[Car], List[Car]]:
     """
-    当前截图有多少个第一排数字组，就有多少个当前可点击列。
-    第二排预览沿用同一 x 轴位置读取颜色。
+    当前截图有多少个第一排数字组，就有多少个当前队列列。
+
+    第一排：读取正常高对比度数字；
+    第二排：读取浅色预览数字。预览 OCR 低置信度时 remain=None，
+    策略仍可知道颜色，但不会把未知容量用于确定性二层安全证明。
     """
     h, _w = image_rgb.shape[:2]
     front: List[Car] = []
@@ -365,6 +383,10 @@ def detect_front_and_next(
 
     if front_numbers is None:
         front_numbers = read_front_numbers_at_centers(image_bgr, centers_x)
+
+    next_numbers: Dict[int, Optional[int]] = {}
+    if read_next_numbers:
+        next_numbers = read_preview_numbers_at_centers(image_bgr, centers_x)
 
     cy = FRONT_Y_N * h
     ncy = NEXT_Y_N * h
@@ -378,8 +400,9 @@ def detect_front_and_next(
             front.append(Car("front", i, color, remain, cx, cy))
 
         ncolor = car_color_at(image_rgb, cx, ncy, palette)
-        if ncolor is not None:
-            nxt.append(Car("next", i, ncolor, None, cx, ncy))
+        nremain = next_numbers.get(i) if read_next_numbers else None
+        if ncolor is not None or nremain is not None:
+            nxt.append(Car("next", i, ncolor, nremain, cx, ncy))
 
     return front, nxt
 

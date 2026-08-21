@@ -25,6 +25,8 @@ class Candidate:
     self_clear_guaranteed: bool
     some_completion_guaranteed: bool
     guaranteed_completions: int
+    chain_parked_completions: int
+    chain_parked_completion_by_color: Dict[int, int]
     deterministic_clear_reachable: bool
     next_color_newly_reachable: int
     useful_newly_reachable: int
@@ -33,6 +35,11 @@ class Candidate:
     reject_reason: str
     score: float
     next_color: Optional[int]
+    next_capacity: Optional[int]
+    queue_unlock_bonus: float
+    next_vehicle_score: float
+    next_vehicle_chain_parked_completions: int
+    next_vehicle_exact: bool
     next_match_contacts: int
     neighbor_contacts: Dict[int, int]
 
@@ -41,6 +48,7 @@ class Candidate:
 class TwoStepPlan:
     first: Candidate
     second: Candidate
+    second_source: str          # front / next
     score: float
     free_slots_before: int
     first_simulated_exactly: bool
