@@ -11,7 +11,7 @@ from .engine import analyze_image, run_auto_flow_mode, run_manual_step_mode
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="游戏截图滚动求解器 v5.3：并发分流闭包 + 联合动作策略 + 决策追踪日志"
+        description="游戏截图滚动求解器 v5.4：拓扑增量棋盘 + 游戏字形OCR + 分流闭包验真"
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--adb", action="store_true", help="使用 ADB")

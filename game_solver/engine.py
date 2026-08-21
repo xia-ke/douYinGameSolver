@@ -12,11 +12,19 @@ import numpy as np
 from .adb import (
     adb_capture_bgr, adb_screencap, adb_tap, save_bgr, shot_stamp,
 )
-from .board import ctag, initial_grid, learn_palette, update_grid
+from .board import (
+    ctag, initial_grid, learn_palette, reachable_summary, update_grid,
+)
 from .config import FRONT_Y_N
 from .display import ClickMark, SolverDisplay
 from .models import AnalysisResult, Candidate, FrontNumberCacheEntry, TwoStepPlan
 from .monitor import wait_for_parking_idle
+from . import ocr as _ocr
+from .game_ocr import (
+    install_game_digit_ocr,
+    read_number_detailed_at,
+)
+install_game_digit_ocr(_ocr)
 from .ocr import read_number_at
 from .state import load_state, save_state
 from .strategy import (
@@ -24,10 +32,12 @@ from .strategy import (
     format_report, format_two_step_plan,
 )
 from .unlock import unlock_sixth_slot_at_game_start
+from . import vehicles as _vehicles
+install_game_digit_ocr(_ocr, _vehicles)
 from .vehicles import (
     _front_number_fingerprint, car_color_at, detect_front_and_next,
     detect_front_centers, detect_parked, extend_palette_from_front_numbers,
-    parking_roi, read_front_numbers_at_centers, read_front_numbers_cached,
+    parking_roi, read_front_numbers_at_centers,
 )
 
 
@@ -114,6 +124,69 @@ def _append_session_marker(
         f.write("#" * 88 + "\n")
 
 
+
+def _stable_state_conflicts(
+    grid: np.ndarray,
+    parked,
+) -> Dict[int, Tuple[int, Tuple[int, ...]]]:
+    """
+    稳定截图中的硬一致性断言。
+
+    游戏规则已经确认：
+      - 车辆到停车位后才开始吸收；
+      - 停车车会持续自动吸收当前可达的同色块；
+      - 监控结束后才进入下一轮分析。
+
+    因此在一张“稳定分析截图”里，如果程序仍认为某停车颜色有
+    reachable > 0，则说明至少有一项状态模型不可信：
+      - 棋盘拓扑/持久化 grid；
+      - 颜色归类；
+      - 停车车颜色；
+      - reachable 定义。
+
+    这种矛盾不能继续被 flow closure 当成 guaranteed safety。
+    """
+    reachable, _neighbors = reachable_summary(grid)
+
+    remains_by_color: Dict[int, list[int]] = {}
+    for car in parked:
+        if car.color is None or car.remain is None:
+            continue
+        remains_by_color.setdefault(int(car.color), []).append(int(car.remain))
+
+    conflicts: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
+    for color, remains in remains_by_color.items():
+        supply = int(reachable.get(color, 0))
+        if supply > 0:
+            conflicts[color] = (
+                supply,
+                tuple(sorted(remains)),
+            )
+    return conflicts
+
+
+def _format_palette_diagnostics(palette: np.ndarray) -> str:
+    """
+    记录最接近的 palette 色对，后续可直接追踪“相近色是否被错误合并”。
+
+    这里只做诊断，不擅自改变分类阈值。
+    """
+    if palette is None or len(palette) < 2:
+        return ""
+
+    pairs = []
+    for i in range(len(palette)):
+        for j in range(i + 1, len(palette)):
+            dist = float(np.linalg.norm(palette[i] - palette[j]))
+            pairs.append((dist, i + 1, j + 1))
+
+    pairs.sort()
+    nearest = pairs[: min(6, len(pairs))]
+    return "；".join(
+        f"{ctag(a)}-{ctag(b)} RGB距离={dist:.1f}"
+        for dist, a, b in nearest
+    )
+
 def analyze_image(
     image_path: Path,
     state_path: Path,
@@ -130,24 +203,31 @@ def analyze_image(
 
     front_centers = detect_front_centers(image_bgr)
 
-    if front_number_cache is None:
-        front_numbers = read_front_numbers_at_centers(image_bgr, front_centers)
-        new_front_cache = {
-            i: FrontNumberCacheEntry(
-                front_numbers.get(i),
-                _front_number_fingerprint(
-                    image_bgr,
-                    float(cx),
-                    FRONT_Y_N * image_h,
-                ),
-            )
-            for i, cx in enumerate(front_centers, 1)
-        }
-        front_ocr_reads = len(front_centers)
-    else:
-        front_numbers, new_front_cache, front_ocr_reads = read_front_numbers_cached(
-            image_bgr, front_centers, front_number_cache
+    # v5.4：先关闭跨轮数字复用。
+    #
+    # 已经在真实截图中确认过：
+    #   红29 离开 -> 绿30 顶上
+    # 旧缓存有机会因为数字区域 fingerprint 变化不足而继续复用 29。
+    #
+    # 每轮只有 3~5 辆第一排车，完整 OCR 的成本远低于错误容量带来的策略风险；
+    # 等“车辆身份 + 颜色签名”缓存重新设计完成后再考虑恢复。
+    del front_number_cache
+    front_numbers = read_front_numbers_at_centers(
+        image_bgr,
+        front_centers,
+    )
+    new_front_cache = {
+        i: FrontNumberCacheEntry(
+            front_numbers.get(i),
+            _front_number_fingerprint(
+                image_bgr,
+                float(cx),
+                FRONT_Y_N * image_h,
+            ),
         )
+        for i, cx in enumerate(front_centers, 1)
+    }
+    front_ocr_reads = len(front_centers)
 
     removed_since_last: Optional[int]
     new_state = reset or not state_path.exists()
@@ -204,6 +284,8 @@ def analyze_image(
             "第一排车辆数字全部识别失败。为避免错误容量导致误点击，自动流程已停止。"
         )
 
+    stable_conflicts = _stable_state_conflicts(grid, parked)
+
     candidates = evaluate_candidates(
         grid, front, nxt, parked, slots, occupied_slots
     )
@@ -223,7 +305,29 @@ def analyze_image(
         slots, len(palette), occupied_slots, new_colors_added,
     )
 
-    if two_step_plan is not None:
+    palette_diag = _format_palette_diagnostics(palette)
+    if palette_diag:
+        report += "\n\n颜色类别诊断（最近 palette 色对）:\n" + palette_diag
+
+    if stable_conflicts:
+        conflict_text = "；".join(
+            (
+                f"{ctag(color)}: 稳定截图仍判定 reachable={supply}, "
+                f"停车剩余={list(remains)}"
+            )
+            for color, (supply, remains) in sorted(stable_conflicts.items())
+        )
+        report += (
+            "\n\n!!! MODEL_INCONSISTENT / 硬安全暂停 !!!\n"
+            "当前截图已经经过停车分流稳定监控，但棋盘模型仍认为停车车存在"
+            "可立即吸收的同色 reachable。按已确认游戏规则，这两件事不能同时成立。\n"
+            f"矛盾项: {conflict_text}\n"
+            "本轮禁止把这些 reachable 用于 guaranteed completion，"
+            "也不执行任何自动点击；请优先检查棋盘拓扑/颜色识别。"
+        )
+        two_step_plan = None
+        best = None
+    elif two_step_plan is not None:
         report += "\n\n" + format_two_step_plan(two_step_plan)
         best = two_step_plan.first
     else:
@@ -292,7 +396,14 @@ def wait_for_promoted_next_car(
         ),
         None,
     )
-    if next_car is None:
+    first_car = next(
+        (
+            c for c in result.front
+            if c.column == plan.first.column
+        ),
+        None,
+    )
+    if next_car is None or first_car is None:
         return False, None, 0, 0
 
     x = int(round(next_car.x))
@@ -304,12 +415,30 @@ def wait_for_promoted_next_car(
     deadline = time.monotonic() + max(0.0, timeout)
     last_frame: Optional[np.ndarray] = None
     last_num: Optional[int] = None
+    last_num_conf = 0.0
+    last_num_votes = 0
     last_color: Optional[int] = None
+    color_match_streak = 0
+
+    # 若 A/B 颜色不同，A 离开后在同一列连续两帧看到 B 的目标颜色，
+    # 已经足以证明 B 补位。此时数字只用于交叉校验，避免旧 OCR 的 0->9 / 1->7
+    # 让正确第二步被取消。
+    distinct_color_transition = (
+        first_car.color is not None
+        and plan.second.color is not None
+        and first_car.color != plan.second.color
+    )
 
     while True:
         frame = adb_capture_bgr(serial)
         last_frame = frame
-        last_num = read_number_at(frame, float(x), float(y))
+
+        last_num, last_num_conf, last_num_votes = read_number_detailed_at(
+            frame,
+            float(x),
+            float(y),
+        )
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32)
         last_color = car_color_at(
             rgb,
@@ -318,11 +447,32 @@ def wait_for_promoted_next_car(
             result.palette,
         )
 
-        matched = (
-            last_num == plan.second.capacity
-            and last_color == plan.second.color
+        color_match = last_color == plan.second.color
+        number_match = last_num == plan.second.capacity
+
+        if color_match:
+            color_match_streak += 1
+        else:
+            color_match_streak = 0
+
+        exact_match = color_match and number_match
+        color_proven_match = (
+            distinct_color_transition
+            and color_match_streak >= 2
         )
-        if matched:
+
+        if exact_match or color_proven_match:
+            if exact_match:
+                confirm_reason = (
+                    "颜色+真实游戏字形数字均与预测一致"
+                )
+            else:
+                confirm_reason = (
+                    "A/B 颜色不同，目标颜色连续两帧确认；"
+                    f"数字OCR={last_num if last_num is not None else 'UNKNOWN'}"
+                    f"（conf={last_num_conf:.2f}, votes={last_num_votes}）仅作交叉校验"
+                )
+
             if display is not None:
                 display.show(
                     frame,
@@ -330,7 +480,7 @@ def wait_for_promoted_next_car(
                     hint=(
                         f"第{plan.second.column}列第二排已顶上："
                         f"{ctag(plan.second.color)}×{plan.second.capacity}；"
-                        "颜色和数字均与预测一致，执行第二次点击。"
+                        f"{confirm_reason}，执行第二次点击。"
                     ),
                     marks=(ClickMark(x, y, "2"),),
                 )
@@ -345,7 +495,8 @@ def wait_for_promoted_next_car(
                         f"补位确认超时：期望 {ctag(plan.second.color)}×"
                         f"{plan.second.capacity}，实际颜色="
                         f"{ctag(last_color) if last_color is not None else 'UNKNOWN'}，"
-                        f"数字={last_num if last_num is not None else 'UNKNOWN'}。"
+                        f"数字={last_num if last_num is not None else 'UNKNOWN'} "
+                        f"(conf={last_num_conf:.2f}, votes={last_num_votes})。"
                         "只保留第一步；第一步自身已通过稳定状态安全检查。"
                     ),
                 )
@@ -358,11 +509,12 @@ def wait_for_promoted_next_car(
                 hint=(
                     f"等待第{plan.second.column}列第二排 "
                     f"{ctag(plan.second.color)}×{plan.second.capacity} "
-                    "进入第一排；不会在未确认时盲点。"
+                    "进入第一排；不同色补位采用连续两帧颜色确认，"
+                    "同色补位仍要求数字一致。"
                 ),
             )
-        time.sleep(max(0.02, poll_interval))
 
+        time.sleep(max(0.02, poll_interval))
 
 def tap_candidate_from_result(
     result: AnalysisResult,
@@ -484,6 +636,7 @@ def _run_auto_flow_mode_impl(
     reset_current = args.reset
     round_no = 0
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
+    pending_prediction: Optional[Tuple[int, str, str]] = None
     log_path = _resolve_decision_log_path(args)
     _append_session_marker(log_path, reset=args.reset)
 
@@ -540,10 +693,26 @@ def _run_auto_flow_mode_impl(
         reset_current = False
         front_number_cache = result.front_number_cache
 
+        if pending_prediction is not None:
+            predicted_upper, predicted_step, predicted_basis = pending_prediction
+            if result.occupied_slots > predicted_upper:
+                result.report += (
+                    "\n\n!!! GUARANTEE_BROKEN / 硬安全暂停 !!!\n"
+                    f"上一轮 {predicted_step} 的模型保证“稳定后停车占用上界 <= "
+                    f"{predicted_upper}”，但本轮稳定截图实际检测到 "
+                    f"{result.occupied_slots}/{args.slots}。\n"
+                    f"上一轮依据: {predicted_basis}\n"
+                    "guaranteed 已被真实结果反证；本轮禁止继续自动点击，"
+                    "避免同一错误假设连续传播。"
+                )
+                result.best = None
+                result.two_step_plan = None
+            pending_prediction = None
+
         print(result.report)
         print(
-            f"速度信息: 本轮第一排实际 OCR {result.front_ocr_reads}/"
-            f"{len(result.front_number_cache)} 列，其余列沿用数字视觉缓存。"
+            f"OCR信息: 本轮第一排完整 OCR {result.front_ocr_reads}/"
+            f"{len(result.front_number_cache)} 列；安全模式下暂不跨车辆复用数字缓存。"
         )
 
         # 每一步先落盘完整决策依据，确保即使后续点击/监控异常也能追溯。
@@ -636,6 +805,11 @@ def _run_auto_flow_mode_impl(
 
         plan = result.two_step_plan
         execution_parts = []
+        predicted_occupied_upper = result.best.flow_final_occupied_upper
+        predicted_basis = (
+            f"single {ctag(result.best.color)}x{result.best.capacity} "
+            f"flow_final_occupied_upper={result.best.flow_final_occupied_upper}"
+        )
 
         # v5.3：双步最坏两辆都留下时只要求不超过 6，因此空位>=2 即可。
         if plan is not None and (args.slots - result.occupied_slots) >= 2:
@@ -761,7 +935,21 @@ def _run_auto_flow_mode_impl(
                 )
 
             if second_executed:
+                predicted_occupied_upper = plan.final_occupied_upper
+                predicted_basis = (
+                    f"two-step score={plan.score:.1f}, "
+                    f"flow_final_occupied_upper={plan.final_occupied_upper}, "
+                    f"guaranteed_completions={plan.guaranteed_completions}"
+                )
                 print("两步已连续执行；现在只做一次停车数字分流监控。")
+            else:
+                # 同列第二步未执行时，只验证第一步自己的保证。
+                predicted_occupied_upper = plan.first.flow_final_occupied_upper
+                predicted_basis = (
+                    f"two-step fallback to first only; "
+                    f"flow_final_occupied_upper="
+                    f"{plan.first.flow_final_occupied_upper}"
+                )
         else:
             target_car = next(
                 c for c in result.front
@@ -832,6 +1020,22 @@ def _run_auto_flow_mode_impl(
             screenshot=shot,
             step_label=step_label,
             execution=f"monitor_end={Path(monitor_end).name if monitor_end else monitor_end}",
+        )
+
+        pending_prediction = (
+            int(predicted_occupied_upper),
+            step_label,
+            predicted_basis,
+        )
+        _append_execution_update(
+            log_path,
+            screenshot=shot,
+            step_label=step_label,
+            execution=(
+                "prediction_checkpoint "
+                f"next_stable_parking_upper={predicted_occupied_upper}; "
+                f"basis={predicted_basis}"
+            ),
         )
 
         if args.analysis_settle_delay > 0:
