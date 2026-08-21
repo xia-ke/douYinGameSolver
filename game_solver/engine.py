@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -12,7 +13,7 @@ from .adb import (
     adb_capture_bgr, adb_screencap, adb_tap, save_bgr, shot_stamp,
 )
 from .board import ctag, initial_grid, learn_palette, update_grid
-from .config import FRONT_X_N, FRONT_Y_N
+from .config import FRONT_Y_N
 from .display import ClickMark, SolverDisplay
 from .models import AnalysisResult, Candidate, FrontNumberCacheEntry, TwoStepPlan
 from .monitor import wait_for_parking_idle
@@ -24,10 +25,94 @@ from .strategy import (
 )
 from .unlock import unlock_sixth_slot_at_game_start
 from .vehicles import (
-    _front_number_fingerprint, car_color_at, detect_front_and_next, detect_front_centers,
-    detect_parked, extend_palette_from_front_numbers, parking_roi,
-    read_front_numbers_at_centers, read_front_numbers_cached,
+    _front_number_fingerprint, car_color_at, detect_front_and_next,
+    detect_front_centers, detect_parked, extend_palette_from_front_numbers,
+    parking_roi, read_front_numbers_at_centers, read_front_numbers_cached,
 )
+
+
+def _resolve_decision_log_path(args: argparse.Namespace) -> Path:
+    path = getattr(args, "decision_log", None)
+    if path is not None:
+        return Path(path)
+    return args.shots_dir / "decision_log.txt"
+
+
+def _append_decision_log(
+    log_path: Path,
+    *,
+    screenshot: Path,
+    result: AnalysisResult,
+    step_label: str,
+    execution: Optional[str] = None,
+) -> None:
+    """
+    追加一条可追踪的决策记录。
+
+    每一步都绑定：
+      - 分析截图文件名/路径
+      - 当前 turn / step
+      - 完整候选与策略依据（result.report）
+      - 最终计划
+      - 可选的实际执行结果
+
+    使用 append 而不是覆盖，便于同一日志连续追踪多局；每个自动运行会写 SESSION
+    分隔，--reset 时额外标记 NEW GAME。
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    lines = [
+        "",
+        "=" * 88,
+        f"[DECISION] time={timestamp}",
+        f"step={step_label}",
+        f"turn={result.turn}",
+        f"screenshot={screenshot.name}",
+        f"screenshot_path={screenshot}",
+        f"parking={result.occupied_slots}",
+        "-" * 88,
+        result.report,
+    ]
+    if execution:
+        lines.extend([
+            "-" * 88,
+            f"execution={execution}",
+        ])
+    lines.append("=" * 88)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _append_execution_update(
+    log_path: Path,
+    *,
+    screenshot: Path,
+    step_label: str,
+    execution: str,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(
+            f"[EXECUTION] time={timestamp} step={step_label} "
+            f"screenshot={screenshot.name} {execution}\n"
+        )
+
+
+def _append_session_marker(
+    log_path: Path,
+    *,
+    reset: bool,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n" + "#" * 88 + "\n")
+        f.write(f"[SESSION] start={timestamp}\n")
+        if reset:
+            f.write("[NEW GAME] --reset 已启用，本次从新局状态开始\n")
+        f.write("#" * 88 + "\n")
+
 
 def analyze_image(
     image_path: Path,
@@ -75,10 +160,11 @@ def analyze_image(
         grid = initial_grid(image_rgb, palette)
         turn = 0
         removed_since_last = None
-        # 保留字段以兼容 v3 状态文件结构；v4 不再用它做停车占用硬判断。
         parking_empty_ref = parking_roi(image_bgr)
     else:
-        palette, prev_grid, turn, saved_size, parking_empty_ref = load_state(state_path)
+        palette, prev_grid, turn, saved_size, parking_empty_ref = load_state(
+            state_path
+        )
         if saved_size != (image_w, image_h):
             raise RuntimeError(
                 f"截图尺寸从 {saved_size[0]}x{saved_size[1]} 变成 "
@@ -93,7 +179,6 @@ def analyze_image(
         image_rgb, image_bgr, palette, front_centers, front_numbers
     )
 
-    # 停车车使用数字锚点：一组 1/2 位数字 = 一辆车。
     parked = detect_parked(
         image_rgb, image_bgr, palette, read_numbers=True
     )
@@ -105,7 +190,6 @@ def analyze_image(
             "为避免误点击已停止。"
         )
 
-    # 停车车若数字已找到但颜色无法可靠匹配，也不能参与安全证明。
     incomplete_parked = [
         c for c in parked if c.color is None or c.remain is None
     ]
@@ -141,7 +225,6 @@ def analyze_image(
 
     if two_step_plan is not None:
         report += "\n\n" + format_two_step_plan(two_step_plan)
-        # 双步模式下第一步选择应服从“整对动作”的预测，而不是单步最高分。
         best = two_step_plan.first
     else:
         best = best_valid_candidate(candidates)
@@ -172,13 +255,10 @@ def analyze_image(
     )
 
 
-def queue_empty_on_image(image_bgr: np.ndarray, palette: np.ndarray) -> Tuple[bool, int]:
-    """
-    轻量确认排队区是否无车。
-
-    胜利判定直接看当前第一排数字组是否存在。
-    列数动态，因此不会再因“本关是5列而代码只看4列”误判为空。
-    """
+def queue_empty_on_image(
+    image_bgr: np.ndarray,
+    palette: np.ndarray,
+) -> Tuple[bool, int]:
     centers = detect_front_centers(image_bgr)
     if not centers:
         return True, 0
@@ -195,7 +275,6 @@ def queue_empty_on_image(image_bgr: np.ndarray, palette: np.ndarray) -> Tuple[bo
     return (len(front) == 0), added
 
 
-
 def wait_for_promoted_next_car(
     result: AnalysisResult,
     plan: TwoStepPlan,
@@ -206,15 +285,6 @@ def wait_for_promoted_next_car(
     initial_delay: float,
     display: Optional[SolverDisplay] = None,
 ) -> Tuple[bool, Optional[np.ndarray], int, int]:
-    """
-    同列第二排计划的毫秒级补位确认。
-
-    不重新分析棋盘，只在预期列的第一排位置检查：
-      - 颜色 == 预测的第二排颜色；
-      - 数字 == 预测的第二排数字。
-
-    两项同时吻合才允许第二次点击。超时只放弃第二步，不会误点。
-    """
     next_car = next(
         (
             c for c in result.nxt
@@ -276,7 +346,7 @@ def wait_for_promoted_next_car(
                         f"{plan.second.capacity}，实际颜色="
                         f"{ctag(last_color) if last_color is not None else 'UNKNOWN'}，"
                         f"数字={last_num if last_num is not None else 'UNKNOWN'}。"
-                        "只保留第一步，进入正常分流监控。"
+                        "只保留第一步；第一步自身已通过稳定状态安全检查。"
                     ),
                 )
             return False, last_frame, x, y
@@ -300,12 +370,6 @@ def tap_candidate_from_result(
     serial: Optional[str],
     candidate: Optional[Candidate] = None,
 ) -> Tuple[int, int]:
-    """
-    按当前分析帧中的真实车辆坐标点击。
-
-    candidate=None 时点击 result.best；
-    双步模式第二次点击会明确传入 result.two_step_plan.second。
-    """
     target = candidate if candidate is not None else result.best
     if target is None:
         raise ValueError("当前没有候选动作")
@@ -331,17 +395,27 @@ def tap_candidate_from_result(
 def run_manual_step_mode(args: argparse.Namespace) -> int:
     first = True
     reset_next = args.reset
+    log_path = _resolve_decision_log_path(args)
+    _append_session_marker(log_path, reset=args.reset)
+
     print("人工逐步调试模式。")
+    print(f"决策日志: {log_path}")
+
+    manual_no = 0
     while True:
-        cmd = input("\nEnter截图分析；q退出；r将下一张作为新局重建状态: ").strip().lower()
+        cmd = input(
+            "\nEnter截图分析；q退出；r将下一张作为新局重建状态: "
+        ).strip().lower()
         if cmd == "q":
             return 0
         if cmd == "r":
             reset_next = True
 
+        manual_no += 1
         shot = args.shots_dir / f"manual_{shot_stamp()}.png"
         adb_screencap(shot, args.serial)
         print(f"截图: {shot}")
+
         result = analyze_image(
             shot, args.state,
             reset=(reset_next or (first and not args.state.exists())),
@@ -349,12 +423,40 @@ def run_manual_step_mode(args: argparse.Namespace) -> int:
         )
         print(result.report)
 
+        step_label = f"manual-{manual_no}"
+        _append_decision_log(
+            log_path,
+            screenshot=shot,
+            result=result,
+            step_label=step_label,
+        )
+
         if not args.no_auto_tap and result.best is not None:
             if args.tap_delay > 0:
                 time.sleep(args.tap_delay)
             x, y = tap_candidate_from_result(result, serial=args.serial)
-            print(f"自动点击完成: 第一排第 {result.best.column} 列 {ctag(result.best.color)}×{result.best.capacity}，坐标=({x}, {y})")
+            text = (
+                f"click column={result.best.column} "
+                f"car={ctag(result.best.color)}x{result.best.capacity} "
+                f"xy=({x},{y})"
+            )
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=text,
+            )
+            print(
+                f"自动点击完成: 第一排第 {result.best.column} 列 "
+                f"{ctag(result.best.color)}×{result.best.capacity}，坐标=({x}, {y})"
+            )
         elif result.best is None:
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution="no-click: no safe candidate",
+            )
             print("未执行点击：没有安全候选。")
 
         first = False
@@ -382,13 +484,12 @@ def _run_auto_flow_mode_impl(
     reset_current = args.reset
     round_no = 0
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
+    log_path = _resolve_decision_log_path(args)
+    _append_session_marker(log_path, reset=args.reset)
 
     print("完全自动模式已启动。按 Ctrl+C 可随时停止。")
+    print(f"决策日志: {log_path}")
 
-    # 每次自动模式启动都先“看一眼”解锁按钮，而不是再用 state 文件猜是不是新局。
-    # - 按钮存在：自动点击并观看广告；
-    # - 按钮不存在：立即跳过；
-    # 因此即使用户忘记 --reset 或保留了旧 solver_state.npz，也不会漏掉新局解锁。
     if not args.skip_sixth_slot_unlock:
         did_unlock = unlock_sixth_slot_at_game_start(
             serial=args.serial,
@@ -399,31 +500,35 @@ def _run_auto_flow_mode_impl(
         if did_unlock and args.unlock_return_settle_delay > 0:
             time.sleep(args.unlock_return_settle_delay)
     else:
-        print("已启用 --skip-sixth-slot-unlock：跳过第6停车位自动解锁检查。")
+        print("--skip-sixth-slot-unlock：跳过第6停车位自动解锁检查。")
+
     print(
         f"分流判定: 点击后 {args.flow_start_delay:.1f}s 建基准；"
         f"每 {args.parking_check_interval:.1f}s 检查；"
         f"连续 {args.parking_idle_timeout:.1f}s 无停车数字像素变化才进入下一步。"
     )
-    print("监控截图与分析截图已完全分离：每个自动轮次都会重新 ADB 截取 analysis_*.png。")
+    print(
+        "策略模型: 多车并发吸收 + 自动分流闭包；"
+        "稳定后停车占用最坏上界必须 < 总停车位。"
+    )
 
     while True:
         round_no += 1
+        step_label = f"auto-{round_no}"
         print("\n" + "#" * 72)
         print(f"自动轮次 {round_no}")
         print("#" * 72)
 
-        # 关键修复：无论上一轮监控返回什么图片，本轮都重新截图。
-        # monitor_end_*.png 只用于诊断，永远不会进入 analyze_image。
         shot = args.shots_dir / f"analysis_{shot_stamp()}.png"
         adb_screencap(shot, args.serial)
         print(f"分析截图: {shot}")
+
         analysis_bgr = cv2.imread(str(shot), cv2.IMREAD_COLOR)
         if analysis_bgr is not None:
             display.show(
                 analysis_bgr,
                 stage=f"自动轮次 {round_no} · 正在分析",
-                hint="正在识别棋盘、排队车辆、停车车辆并计算安全候选。",
+                hint="正在识别棋盘、队列与停车车辆，并执行并发分流闭包策略。",
             )
 
         result = analyze_image(
@@ -434,13 +539,21 @@ def _run_auto_flow_mode_impl(
         )
         reset_current = False
         front_number_cache = result.front_number_cache
+
         print(result.report)
         print(
             f"速度信息: 本轮第一排实际 OCR {result.front_ocr_reads}/"
             f"{len(result.front_number_cache)} 列，其余列沿用数字视觉缓存。"
         )
 
-        # 胜利判定按用户规则：排队区没有车辆。为防补位动画中间的空帧，连续确认两次。
+        # 每一步先落盘完整决策依据，确保即使后续点击/监控异常也能追溯。
+        _append_decision_log(
+            log_path,
+            screenshot=shot,
+            result=result,
+            step_label=step_label,
+        )
+
         if len(result.front) == 0 and len(result.nxt) == 0:
             if analysis_bgr is not None:
                 display.show(
@@ -451,51 +564,81 @@ def _run_auto_flow_mode_impl(
                         f"等待 {args.queue_empty_confirm_delay:.1f}s 再确认一次。"
                     ),
                 )
-            print(f"排队区第一次检测为空，等待 {args.queue_empty_confirm_delay:.1f}s 再确认一次...")
             time.sleep(args.queue_empty_confirm_delay)
             confirm_bgr = adb_capture_bgr(args.serial)
             empty2, _added = queue_empty_on_image(confirm_bgr, result.palette)
             confirm_path = args.shots_dir / f"queue_confirm_{shot_stamp()}.png"
             save_bgr(confirm_path, confirm_bgr)
+
             if empty2:
+                _append_execution_update(
+                    log_path,
+                    screenshot=shot,
+                    step_label=step_label,
+                    execution=f"game-complete confirm={confirm_path.name}",
+                )
                 display.show(
                     confirm_bgr,
                     stage="本局完成",
                     hint="排队区连续两次无车辆；判定本局结束。",
                 )
-                print(f"排队区连续两次无车辆，判定本局结束。确认截图: {confirm_path}")
+                print(
+                    f"排队区连续两次无车辆，判定本局结束。确认截图: {confirm_path}"
+                )
                 return 0
 
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    f"queue-empty-cancelled confirm={confirm_path.name}; "
+                    "second check found vehicles"
+                ),
+            )
             display.show(
                 confirm_bgr,
                 stage="胜利确认取消",
                 hint="第二次重新检测到排队车辆；刚才只是补位动画，重新分析。",
             )
-            print("第二次检测到排队车辆，说明刚才处于补位动画；旧建议作废，下一轮重新截图分析。")
             if args.analysis_settle_delay > 0:
                 time.sleep(args.analysis_settle_delay)
             continue
 
         if args.no_auto_tap:
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution="no-auto-tap: analysis only",
+            )
             print("已启用 --no-auto-tap：完成一次分析后退出。")
             return 0
 
         if result.best is None:
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution="safety-stop: no stable-safe candidate",
+            )
             if analysis_bgr is not None:
                 display.show(
                     analysis_bgr,
                     stage="安全暂停",
-                    hint="当前没有通过硬安全约束的候选动作；未执行点击。",
+                    hint="当前没有通过稳定状态硬安全约束的候选动作；未执行点击。",
                 )
-            print("自动流程暂停：当前没有通过硬安全约束的候选动作。")
+            print("自动流程暂停：当前没有通过稳定状态硬安全约束的候选动作。")
             return 0
 
         if args.tap_delay > 0:
             time.sleep(args.tap_delay)
 
         plan = result.two_step_plan
+        execution_parts = []
 
-        if plan is not None and (args.slots - result.occupied_slots) >= 3:
+        # v5.3：双步最坏两辆都留下时只要求不超过 6，因此空位>=2 即可。
+        if plan is not None and (args.slots - result.occupied_slots) >= 2:
             first_car = next(
                 c for c in result.front
                 if c.column == plan.first.column
@@ -510,7 +653,7 @@ def _run_auto_flow_mode_impl(
                 second_hint = (
                     f"第{plan.second.column}列第二排 "
                     f"{ctag(plan.second.color)}×{plan.second.capacity}；"
-                    "第一步后顶到第一排，快速确认再点击。"
+                    "第一步离开后立即顶上，快速确认再点击。"
                 )
             else:
                 second_visual_car = next(
@@ -530,10 +673,15 @@ def _run_auto_flow_mode_impl(
                     hint=(
                         f"第1步：第{plan.first.column}列 "
                         f"{ctag(plan.first.color)}×{plan.first.capacity}；"
-                        f"第2步：{second_hint} 两次点击后只做一次完整分流监控。"
+                        f"第2步：{second_hint} "
+                        "A+B 已按并发联合动作闭包证明稳定安全。"
                     ),
                     marks=(
-                        ClickMark(int(round(first_car.x)), int(round(first_car.y)), "1"),
+                        ClickMark(
+                            int(round(first_car.x)),
+                            int(round(first_car.y)),
+                            "1",
+                        ),
                         ClickMark(
                             int(round(second_visual_car.x)),
                             int(round(second_visual_car.y)),
@@ -546,6 +694,11 @@ def _run_auto_flow_mode_impl(
                 result,
                 serial=args.serial,
                 candidate=plan.first,
+            )
+            execution_parts.append(
+                f"step1 col={plan.first.column} "
+                f"{ctag(plan.first.color)}x{plan.first.capacity} "
+                f"xy=({x1},{y1})"
             )
             print(
                 f"连续两步 1/2: 第 {plan.first.column} 列 "
@@ -568,15 +721,24 @@ def _run_auto_flow_mode_impl(
                 if ok:
                     adb_tap(x2, y2, args.serial)
                     second_executed = True
+                    execution_parts.append(
+                        f"step2-next confirmed col={plan.second.column} "
+                        f"{ctag(plan.second.color)}x{plan.second.capacity} "
+                        f"xy=({x2},{y2})"
+                    )
                     print(
                         f"连续两步 2/2: 同列补位确认通过，第 {plan.second.column} 列 "
                         f"{ctag(plan.second.color)}×{plan.second.capacity}，"
                         f"坐标=({x2}, {y2})"
                     )
                 else:
+                    execution_parts.append(
+                        "step2-next cancelled: promote confirmation failed; "
+                        "first step remains stable-safe"
+                    )
                     print(
-                        "连续两步第二步取消：同列补位在限定时间内未通过颜色+数字确认；"
-                        "不会盲点，直接监控第一步产生的分流。"
+                        "连续两步第二步取消：补位未通过颜色+数字确认；"
+                        "第一步单独也已通过稳定状态安全检查。"
                     )
             else:
                 if args.double_step_gap > 0:
@@ -587,6 +749,11 @@ def _run_auto_flow_mode_impl(
                     candidate=plan.second,
                 )
                 second_executed = True
+                execution_parts.append(
+                    f"step2-front col={plan.second.column} "
+                    f"{ctag(plan.second.color)}x{plan.second.capacity} "
+                    f"xy=({x2},{y2})"
+                )
                 print(
                     f"连续两步 2/2: 第 {plan.second.column} 列 "
                     f"{ctag(plan.second.color)}×{plan.second.capacity}，"
@@ -621,11 +788,23 @@ def _run_auto_flow_mode_impl(
                 result,
                 serial=args.serial,
             )
+            execution_parts.append(
+                f"single col={result.best.column} "
+                f"{ctag(result.best.color)}x{result.best.capacity} "
+                f"xy=({x},{y})"
+            )
             print(
                 f"自动点击完成: 第一排第 {result.best.column} 列 "
                 f"{ctag(result.best.color)}×{result.best.capacity}，"
                 f"坐标=({x}, {y})"
             )
+
+        _append_execution_update(
+            log_path,
+            screenshot=shot,
+            step_label=step_label,
+            execution="; ".join(execution_parts),
+        )
 
         if analysis_bgr is not None:
             display.show(
@@ -648,8 +827,12 @@ def _run_auto_flow_mode_impl(
             display=display,
         )
         print(f"本轮停车监控结束: {monitor_end}")
+        _append_execution_update(
+            log_path,
+            screenshot=shot,
+            step_label=step_label,
+            execution=f"monitor_end={Path(monitor_end).name if monitor_end else monitor_end}",
+        )
 
-        # 再给 UI/队列补位一个很短的收尾时间，然后进入下一轮；
-        # 下一轮仍会重新 ADB 截 analysis_*.png，而不是复用 monitor_end。
         if args.analysis_settle_delay > 0:
             time.sleep(args.analysis_settle_delay)

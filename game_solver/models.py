@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
+
 @dataclass
 class Car:
     source: str              # front / next / parked
@@ -43,6 +44,12 @@ class Candidate:
     next_match_contacts: int
     neighbor_contacts: Dict[int, int]
 
+    # v5.3：自动分流闭包的稳定状态摘要。
+    flow_cleared_cells: int = 0
+    flow_final_occupied_upper: int = 0
+    flow_exact: bool = True
+    flow_rounds: int = 0
+
 
 @dataclass
 class TwoStepPlan:
@@ -53,6 +60,13 @@ class TwoStepPlan:
     free_slots_before: int
     first_simulated_exactly: bool
     reason: str
+
+    # v5.3：A+B 作为联合动作模拟后的稳定状态。
+    guaranteed_completions: int = 0
+    guaranteed_parked_completions: int = 0
+    cleared_cells: int = 0
+    final_occupied_upper: int = 0
+    flow_exact: bool = True
 
 
 @dataclass

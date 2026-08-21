@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -9,10 +10,26 @@ from .board import ctag, reachable_components, reachable_summary
 from .config import EMPTY, UNKNOWN
 from .models import Car, Candidate, TwoStepPlan
 
-# 队列第二辆的价值会反向计入第一辆，但不把“未来一步”100%算到当前动作上。
-_QUEUE_LOOKAHEAD_EXACT_WEIGHT = 0.62
-_QUEUE_LOOKAHEAD_CONSERVATIVE_WEIGHT = 0.22
+
+_QUEUE_LOOKAHEAD_WEIGHT = 0.70
 _QUEUE_LOOKAHEAD_BONUS_CAP = 120000.0
+_TWO_STEP_MIN_GAIN = 4000.0
+
+
+@dataclass
+class _FlowSimulation:
+    grid: np.ndarray
+    consumed_by_color: Dict[int, int]
+    exposed_by_color: Dict[int, int]
+    cleared_by_color: Dict[int, int]
+    guaranteed_completions: int
+    guaranteed_completions_by_color: Dict[int, int]
+    guaranteed_parked_completions: int
+    guaranteed_parked_completions_by_color: Dict[int, int]
+    final_occupied_upper: int
+    stable_safe: bool
+    exact_grid: bool
+    rounds: int
 
 
 def parked_remainders_by_color(parked: Sequence[Car]) -> Dict[int, List[int]]:
@@ -39,20 +56,59 @@ def guaranteed_completions_from_supply(
     return max(0, guaranteed_moved - no_completion_max)
 
 
+def _guaranteed_parked_completions_from_supply(
+    parked_remainders: Sequence[int],
+    new_remainders: Sequence[int],
+    supply: int,
+) -> int:
+    """
+    同色块可在“已有停车车 + 本次点击车”之间任意分配时，
+    计算至少能保证完成多少辆已有停车车。
+
+    为尽量不让停车车完成，先允许：
+      1) 所有新点击车吸满；
+      2) 每辆停车车只吸到 remain-1。
+    超过这部分的每一个块都会强迫至少一辆停车车完成。
+    """
+    parked_rems = [max(1, int(x)) for x in parked_remainders]
+    new_rems = [max(1, int(x)) for x in new_remainders]
+    if not parked_rems or supply <= 0:
+        return 0
+
+    total_capacity = sum(parked_rems) + sum(new_rems)
+    moved = min(int(supply), total_capacity)
+    no_parked_completion_max = (
+        sum(new_rems)
+        + sum(max(0, remain - 1) for remain in parked_rems)
+    )
+    return max(0, moved - no_parked_completion_max)
+
+
+def _clear_reachable_color(grid: np.ndarray, color: int) -> Tuple[np.ndarray, int]:
+    comps, _ = reachable_components(grid)
+    groups = comps.get(color, [])
+    sim = grid.copy()
+    removed = 0
+    for group in groups:
+        for r, c in group:
+            if int(sim[r, c]) == color:
+                sim[r, c] = EMPTY
+                removed += 1
+    return sim, removed
+
+
 def simulate_clear_current_reachable_color(
     grid: np.ndarray,
     color: int,
 ) -> Tuple[np.ndarray, Dict[int, int]]:
-    """确定性一层模拟：移除当前全部可达该色，再统计新暴露颜色。"""
+    """
+    兼容旧调用：确定性移除当前全部可达该色并返回新暴露颜色。
+    v5.3 的正式策略使用 simulate_flow_closure()。
+    """
     before, _ = reachable_summary(grid)
-    comps, _ = reachable_components(grid)
-    groups = comps.get(color, [])
-    sim = grid.copy()
-    for group in groups:
-        for r, c in group:
-            sim[r, c] = EMPTY
-
+    sim, _removed = _clear_reachable_color(grid, color)
     after, _ = reachable_summary(sim)
+
     unlocked: Dict[int, int] = {}
     for other in set(before) | set(after):
         if other == color:
@@ -63,107 +119,337 @@ def simulate_clear_current_reachable_color(
     return sim, unlocked
 
 
-def _post_first_state(
+def simulate_flow_closure(
     grid: np.ndarray,
-    first: Candidate,
-    first_car: Car,
     parked: Sequence[Car],
-    occupied_slots: int,
-) -> Tuple[np.ndarray, List[Car], int, bool]:
+    action_cars: Sequence[Car],
+    slots: int,
+) -> _FlowSimulation:
     """
-    为二层预测构造第一步之后的状态。
+    对真实游戏规则做保守的“自动分流闭包”：
 
-    exact=True 的情况：
-    - 当前没有该色可达块（点击只把车送入停车区，棋盘不变）；
-    - 或第一步可以确定清空当前全部可达该色。
+    - 停车车与本次点击车辆同时参与吸收；
+    - 只要还有同色车辆有容量，可达同色块就持续被吃；
+    - 同色分配顺序未知，因此车辆完成数按最坏分配保证；
+    - 若同色总剩余容量 >= 当前全部可达块，则该颜色可确定全部清空，
+      从棋盘删除并继续计算下一层暴露；
+    - 若容量不足以清空，则能确定这些容量一定被吃满，但具体删除位置未知，
+      因此不从棋盘删除这部分，后续连锁按保守下界继续；
+    - 直到没有新的确定性清层，得到本轮稳定状态上界。
 
-    其它情况棋盘移除位置不唯一，保留原棋盘作为其它颜色的保守下界，
-    且后续禁止使用确定性“再清一层”的连锁证明。
+    final_occupied_upper 是“分流结束后最多还会留下多少辆车”。
+    真实规则允许过程中短暂 6/6，但稳定后若仍为 6/6 则失败，
+    因此 stable_safe 要求 final_occupied_upper < slots。
     """
-    sim_grid = grid
-    exact = first.reachable == 0
+    sim = grid.copy()
 
-    if first.deterministic_clear_reachable:
-        sim_grid, _ = simulate_clear_current_reachable_color(grid, first.color)
-        exact = True
+    parked_by_color = parked_remainders_by_color(parked)
+    action_by_color: Dict[int, List[int]] = defaultdict(list)
+    for car in action_cars:
+        if car.color is None or car.remain is None:
+            continue
+        action_by_color[int(car.color)].append(max(1, int(car.remain)))
 
-    parked_after = list(parked)
-    occupied_after = occupied_slots
+    all_colors = set(parked_by_color) | set(action_by_color)
+    total_capacity: Dict[int, int] = {
+        color: sum(parked_by_color.get(color, []))
+        + sum(action_by_color.get(color, []))
+        for color in all_colors
+    }
 
-    if not first.self_clear_guaranteed:
-        # 最坏占位：不提前抵扣可能被第一步顺带完成的其它停车车。
-        remain_after = first.capacity
-        if first.deterministic_clear_reachable:
-            remain_after = max(1, first.capacity - first.reachable)
+    consumed: Dict[int, int] = defaultdict(int)
+    exposed: Counter = Counter()
+    cleared: Counter = Counter()
+    uncertain_colors: set[int] = set()
+    rounds = 0
 
-        parked_after.append(
-            Car(
-                source="parked",
-                column=None,
-                color=first.color,
-                remain=remain_after,
-                x=first_car.x,
-                y=first_car.y,
+    # 每轮先让“容量不足以清空当前可达区”的颜色确定性耗尽容量；
+    # 再挑一个可以完全清空的颜色移除，重新计算 reachability。
+    max_rounds = int(grid.size) + 32
+    while rounds < max_rounds:
+        rounds += 1
+        reachable, _ = reachable_summary(sim)
+
+        # 容量不足时：所有剩余容量一定被吃光，但删除位置未知。
+        for color in sorted(all_colors):
+            remaining_capacity = max(
+                0, int(total_capacity.get(color, 0)) - int(consumed.get(color, 0))
             )
+            r = int(reachable.get(color, 0))
+            if remaining_capacity <= 0 or r <= 0:
+                continue
+            if remaining_capacity < r:
+                consumed[color] += remaining_capacity
+                uncertain_colors.add(color)
+
+        # 找一个仍有容量且能把当前全部可达同色块吃完的颜色。
+        reachable, _ = reachable_summary(sim)
+        clear_color: Optional[int] = None
+        for color in sorted(all_colors):
+            remaining_capacity = max(
+                0, int(total_capacity.get(color, 0)) - int(consumed.get(color, 0))
+            )
+            r = int(reachable.get(color, 0))
+            if r > 0 and remaining_capacity >= r:
+                clear_color = color
+                break
+
+        if clear_color is None:
+            break
+
+        before = dict(reachable)
+        r = int(before.get(clear_color, 0))
+        new_grid, removed = _clear_reachable_color(sim, clear_color)
+        if removed <= 0:
+            break
+
+        sim = new_grid
+        consumed[clear_color] += r
+        cleared[clear_color] += removed
+
+        after, _ = reachable_summary(sim)
+        for other in set(before) | set(after):
+            if other == clear_color:
+                continue
+            delta = int(after.get(other, 0)) - int(before.get(other, 0))
+            if delta > 0:
+                exposed[other] += delta
+
+    guaranteed_total = 0
+    guaranteed_by_color: Dict[int, int] = {}
+    parked_total = 0
+    parked_completed_by_color: Dict[int, int] = {}
+
+    for color in sorted(all_colors):
+        supply = int(consumed.get(color, 0))
+        parked_rems = parked_by_color.get(color, [])
+        new_rems = action_by_color.get(color, [])
+        all_rems = list(parked_rems) + list(new_rems)
+
+        completed = guaranteed_completions_from_supply(all_rems, supply)
+        if completed > 0:
+            guaranteed_by_color[color] = completed
+            guaranteed_total += completed
+
+        parked_completed = _guaranteed_parked_completions_from_supply(
+            parked_rems,
+            new_rems,
+            supply,
         )
-        occupied_after += 1
+        if parked_completed > 0:
+            parked_completed_by_color[color] = parked_completed
+            parked_total += parked_completed
 
-    return sim_grid, parked_after, occupied_after, exact
+    total_cars_after_clicks = len(parked) + len(action_cars)
+    final_occupied_upper = max(0, total_cars_after_clicks - guaranteed_total)
+    stable_safe = final_occupied_upper < slots
+
+    return _FlowSimulation(
+        grid=sim,
+        consumed_by_color=dict(sorted(consumed.items())),
+        exposed_by_color=dict(sorted(exposed.items())),
+        cleared_by_color=dict(sorted(cleared.items())),
+        guaranteed_completions=guaranteed_total,
+        guaranteed_completions_by_color=guaranteed_by_color,
+        guaranteed_parked_completions=parked_total,
+        guaranteed_parked_completions_by_color=parked_completed_by_color,
+        final_occupied_upper=final_occupied_upper,
+        stable_safe=stable_safe,
+        exact_grid=(len(uncertain_colors) == 0),
+        rounds=rounds,
+    )
 
 
-def _evaluate_promoted_next_candidate(
+def _parking_release_weight(occupied_slots: int, slots: int) -> float:
+    if slots <= 0:
+        return 35000.0
+    pressure = min(1.0, max(0.0, occupied_slots / slots))
+    return 35000.0 + 50000.0 * pressure * pressure
+
+
+def _score_flow(
+    sim: _FlowSimulation,
+    *,
+    occupied_slots: int,
+    slots: int,
+    action_count: int,
+    useful_colors: Sequence[int],
+    next_color: Optional[int] = None,
+) -> float:
+    """
+    只基于“联合动作完成后的稳定状态变化”评分。
+    不再把 A 的奖励和 B 的奖励机械相加，从根源避免同一批新暴露块重复计分。
+    """
+    useful = set(useful_colors)
+    cleared_cells = sum(sim.cleared_by_color.values())
+    useful_exposed = sum(
+        n for color, n in sim.exposed_by_color.items() if color in useful
+    )
+    next_exposed = (
+        int(sim.exposed_by_color.get(next_color, 0))
+        if next_color is not None
+        else 0
+    )
+
+    score = 0.0
+
+    # 队列推进本身有价值，但远低于确定完成/释放停车位。
+    score += 3500.0 * action_count
+
+    # 所有车辆的确定完成都会减少最终占位；已有停车车完成额外高权重。
+    score += 22000.0 * sim.guaranteed_completions
+    score += (
+        _parking_release_weight(occupied_slots, slots)
+        * sim.guaranteed_parked_completions
+    )
+
+    # 确定性清盘比单纯 reachable 更重要。
+    score += min(cleared_cells, 160) * 650.0
+    score += min(useful_exposed, 80) * 450.0
+    score += min(next_exposed, 50) * 1100.0
+
+    # 稳定后停车越拥堵，惩罚越强；5/6 时尤其不鼓励留下新车。
+    score -= 550.0 * (sim.final_occupied_upper ** 2)
+    if sim.final_occupied_upper == slots - 1:
+        score -= 4000.0
+
+    # 精确闭包可稍微优先；存在局部删除位置未知时仍然安全，但价值按保守下界。
+    if sim.exact_grid:
+        score += 1500.0
+    else:
+        score -= 1200.0
+
+    return score
+
+
+def _specific_action_car_completion_guaranteed(
+    parked_same_color: Sequence[int],
+    action_capacity: int,
+    total_supply: int,
+) -> bool:
+    """
+    分配顺序完全未知时，要保证“这辆新点击车自己”完成，
+    最坏情况可以先把所有同色停车车喂满。
+    因此只有总供给足以填满所有同色车辆时，才能保证指定新车完成。
+    """
+    total = sum(max(1, int(x)) for x in parked_same_color) + max(
+        1, int(action_capacity)
+    )
+    return int(total_supply) >= total
+
+
+def _build_candidate(
     grid: np.ndarray,
-    first: Candidate,
-    first_car: Car,
+    car: Car,
     next_car: Optional[Car],
     parked: Sequence[Car],
     slots: int,
     occupied_slots: int,
-) -> Tuple[Optional[Candidate], bool]:
-    """评价“点击第一辆后，同列第二排顶上来的车”。"""
-    if (
-        next_car is None
-        or next_car.column is None
-        or next_car.color is None
-        or next_car.remain is None
-    ):
-        return None, False
+    useful_colors: Sequence[int],
+    neighbor_contacts: Dict[int, Counter],
+) -> Candidate:
+    assert car.color is not None
+    assert car.remain is not None
+    assert car.column is not None
 
-    sim_grid, parked_after, occupied_after, exact = _post_first_state(
-        grid,
-        first,
-        first_car,
-        parked,
-        occupied_slots,
+    color = int(car.color)
+    cap = int(car.remain)
+    reachable, _ = reachable_summary(grid)
+    r = int(reachable.get(color, 0))
+    contacts = neighbor_contacts.get(color, Counter())
+
+    sim = simulate_flow_closure(grid, parked, [car], slots)
+    parked_same = parked_remainders_by_color(parked).get(color, [])
+
+    total_supply_for_color = int(sim.consumed_by_color.get(color, 0))
+    self_clear = _specific_action_car_completion_guaranteed(
+        parked_same,
+        cap,
+        total_supply_for_color,
+    )
+    some_completion = sim.guaranteed_completions > 0
+
+    deterministic_clear = (
+        r > 0
+        and int(sim.cleared_by_color.get(color, 0)) >= r
     )
 
-    # 第一车同色且移除位置不确定时，原 reachable 会高估第二辆可用供给。
-    # 这种情况下宁可不把同列第二辆用于确定性前瞻。
-    if not exact and next_car.color == first.color:
-        return None, False
-
-    promoted = Car(
-        source="front",
-        column=next_car.column,
-        color=next_car.color,
-        remain=next_car.remain,
-        x=next_car.x,
-        y=first_car.y,
+    next_color = next_car.color if next_car is not None else None
+    next_capacity = next_car.remain if next_car is not None else None
+    next_new = (
+        int(sim.exposed_by_color.get(next_color, 0))
+        if next_color is not None
+        else 0
+    )
+    useful_new = sum(
+        n
+        for c, n in sim.exposed_by_color.items()
+        if c in set(useful_colors)
+    )
+    next_match_contacts = (
+        int(contacts.get(next_color, 0))
+        if next_color is not None
+        else 0
     )
 
-    second_candidates = evaluate_candidates(
-        sim_grid,
-        [promoted],
-        [],
-        parked_after,
-        slots,
-        occupied_after,
-        include_queue_lookahead=False,
-        allow_deterministic_unlock=exact,
+    score = _score_flow(
+        sim,
+        occupied_slots=occupied_slots,
+        slots=slots,
+        action_count=1,
+        useful_colors=useful_colors,
+        next_color=next_color,
     )
-    if not second_candidates:
-        return None, exact
-    return second_candidates[0], exact
+
+    # 对无法产生确定性清层的动作，保留少量即时填充启发，作为安全候选间的次级排序。
+    fill_ratio = min(1.0, r / max(1, cap))
+    score += 2200.0 * fill_ratio
+    score += min(r, 100) * 6.0
+    score += next_match_contacts * 80.0
+
+    if r == 0:
+        score -= 1800.0
+
+    rejected = not sim.stable_safe
+    reason = ""
+    if rejected:
+        reason = (
+            f"按自动分流闭包的最坏分配，分流稳定后停车占用上界仍为 "
+            f"{sim.final_occupied_upper}/{slots}；本游戏稳定后 6/6 会立即失败"
+        )
+
+    return Candidate(
+        column=int(car.column),
+        color=color,
+        capacity=cap,
+        reachable=r,
+        self_clear_guaranteed=self_clear,
+        some_completion_guaranteed=some_completion,
+        guaranteed_completions=sim.guaranteed_completions,
+        chain_parked_completions=sim.guaranteed_parked_completions,
+        chain_parked_completion_by_color=dict(
+            sim.guaranteed_parked_completions_by_color
+        ),
+        deterministic_clear_reachable=deterministic_clear,
+        next_color_newly_reachable=next_new,
+        useful_newly_reachable=useful_new,
+        unlocked_by_color=dict(sim.exposed_by_color),
+        rejected=rejected,
+        reject_reason=reason,
+        score=float(score),
+        next_color=next_color,
+        next_capacity=next_capacity,
+        queue_unlock_bonus=0.0,
+        next_vehicle_score=0.0,
+        next_vehicle_chain_parked_completions=0,
+        next_vehicle_exact=False,
+        next_match_contacts=next_match_contacts,
+        neighbor_contacts=dict(contacts),
+        flow_cleared_cells=sum(sim.cleared_by_color.values()),
+        flow_final_occupied_upper=sim.final_occupied_upper,
+        flow_exact=sim.exact_grid,
+        flow_rounds=sim.rounds,
+    )
 
 
 def evaluate_candidates(
@@ -177,157 +463,39 @@ def evaluate_candidates(
     include_queue_lookahead: bool = True,
     allow_deterministic_unlock: bool = True,
 ) -> List[Candidate]:
-    reachable, neighbor_contacts = reachable_summary(grid)
-    parked_by_color = parked_remainders_by_color(parked)
+    # allow_deterministic_unlock 保留在接口中兼容旧调用；v5.3 的闭包自身决定
+    # 哪些颜色能被数学证明清空，不再由外部强制禁用。
+    del allow_deterministic_unlock
+
+    _reachable, neighbor_contacts = reachable_summary(grid)
     next_by_col = {c.column: c for c in nxt if c.column is not None}
     front_by_col = {c.column: c for c in front if c.column is not None}
 
-    candidates: List[Candidate] = []
-    occupied = occupied_slots
     active_front_colors = {c.color for c in front if c.color is not None}
     parked_colors = {c.color for c in parked if c.color is not None}
-    useful_colors = active_front_colors | parked_colors
+    useful_colors = {
+        int(c) for c in (active_front_colors | parked_colors) if c is not None
+    }
 
-    deterministic_unlock_cache: Dict[int, Dict[int, int]] = {}
-
+    candidates: List[Candidate] = []
     for car in front:
         if car.color is None or car.remain is None or car.column is None:
             continue
-
-        color = car.color
-        cap = car.remain
-        r = int(reachable.get(color, 0))
-        existing = list(parked_by_color.get(color, []))
-        all_rems = existing + [cap]
-
-        self_clear = len(existing) == 0 and r >= cap
-        guaranteed_completions = guaranteed_completions_from_supply(all_rems, r)
-        some_completion = guaranteed_completions >= 1
-
-        contacts = neighbor_contacts.get(color, Counter())
-        next_car = next_by_col.get(car.column)
-        next_color = next_car.color if next_car else None
-        next_capacity = next_car.remain if next_car else None
-        next_match_contacts = int(contacts.get(next_color, 0)) if next_color else 0
-
-        deterministic_clear = (
-            allow_deterministic_unlock
-            and r > 0
-            and len(existing) == 0
-            and cap >= r
+        candidate = _build_candidate(
+            grid,
+            car,
+            next_by_col.get(car.column),
+            parked,
+            slots,
+            occupied_slots,
+            useful_colors,
+            neighbor_contacts,
         )
-        unlocked: Dict[int, int] = {}
-        if deterministic_clear:
-            if color not in deterministic_unlock_cache:
-                _sim, cached_unlocked = simulate_clear_current_reachable_color(grid, color)
-                deterministic_unlock_cache[color] = dict(cached_unlocked)
-            unlocked = deterministic_unlock_cache[color]
+        candidates.append(candidate)
 
-        next_new = int(unlocked.get(next_color, 0)) if next_color is not None else 0
-        useful_new = sum(v for k, v in unlocked.items() if k in useful_colors)
-        all_new = sum(unlocked.values())
-
-        chain_completion_by_color: Dict[int, int] = {}
-        chain_parked_completions = 0
-        if deterministic_clear and unlocked:
-            for unlocked_color, newly_reachable in unlocked.items():
-                parked_rems = parked_by_color.get(unlocked_color, [])
-                if not parked_rems:
-                    continue
-                completed = guaranteed_completions_from_supply(
-                    parked_rems,
-                    int(newly_reachable),
-                )
-                if completed > 0:
-                    chain_completion_by_color[unlocked_color] = completed
-                    chain_parked_completions += completed
-
-        rejected = False
-        reason = ""
-        if occupied >= slots - 1 and not (
-            self_clear
-            or some_completion
-            or chain_parked_completions > 0
-        ):
-            rejected = True
-            reason = (
-                f"只剩最后一个停车位；当前只能确定 {r} 个 {ctag(color)} 可进入，"
-                "且确定性开路也不能保证至少一辆已有停车车消失"
-            )
-
-        score = 0.0
-        if self_clear:
-            score += 50000.0
-        elif some_completion:
-            score += 42000.0
-
-        if chain_parked_completions > 0:
-            score += 50000.0 * chain_parked_completions
-
-        if deterministic_clear:
-            score += 20000.0
-            score += min(next_new, 30) * 2500.0
-            score += min(useful_new, 40) * 600.0
-            score += min(all_new, 60) * 100.0
-
-        fill_ratio = min(1.0, r / max(1, cap))
-        score += 2500.0 * fill_ratio
-        score += min(r, 100) * 6.0
-
-        if self_clear:
-            score += max(0, r - cap) * 15.0
-            score += max(0, 60 - cap) * 2.0
-        else:
-            score -= 1000.0 + occupied * 450.0
-
-        score += next_match_contacts * 100.0
-        if next_color is not None:
-            score += min(40, int(reachable.get(next_color, 0))) * 35.0
-        for other_color, contact_n in contacts.items():
-            if other_color in useful_colors:
-                score += min(contact_n, 30) * 15.0
-
-        if existing and not some_completion:
-            score -= 500.0
-        if r == 0:
-            score -= 1800.0
-        if rejected:
-            score = -1e12
-
-        candidates.append(
-            Candidate(
-                column=car.column,
-                color=color,
-                capacity=cap,
-                reachable=r,
-                self_clear_guaranteed=self_clear,
-                some_completion_guaranteed=some_completion,
-                guaranteed_completions=guaranteed_completions,
-                chain_parked_completions=chain_parked_completions,
-                chain_parked_completion_by_color=dict(
-                    sorted(chain_completion_by_color.items())
-                ),
-                deterministic_clear_reachable=deterministic_clear,
-                next_color_newly_reachable=next_new,
-                useful_newly_reachable=useful_new,
-                unlocked_by_color=dict(sorted(unlocked.items())),
-                rejected=rejected,
-                reject_reason=reason,
-                score=score,
-                next_color=next_color,
-                next_capacity=next_capacity,
-                queue_unlock_bonus=0.0,
-                next_vehicle_score=0.0,
-                next_vehicle_chain_parked_completions=0,
-                next_vehicle_exact=False,
-                next_match_contacts=next_match_contacts,
-                neighbor_contacts=dict(contacts),
-            )
-        )
-
-    # ---------- 二层队列前瞻 ----------
-    # A 本身收益可以很低，但点击 A 一定会让同列第二排 B 顶上。
-    # 若 B 的数字也已可靠读取，就把 B 的战略价值折算回 A。
+    # ---------- 第二排价值传播 ----------
+    # B 顶上是立即发生的，而 A/B 的吸收过程可以并发。
+    # 因此直接模拟联合动作 [A, B]，不再先生成 A 的“串行 post-state”。
     if include_queue_lookahead:
         for candidate in candidates:
             if candidate.rejected:
@@ -335,40 +503,59 @@ def evaluate_candidates(
 
             first_car = front_by_col.get(candidate.column)
             next_car = next_by_col.get(candidate.column)
-            if first_car is None or next_car is None:
+            if (
+                first_car is None
+                or next_car is None
+                or next_car.color is None
+                or next_car.remain is None
+            ):
                 continue
 
-            lookahead, exact = _evaluate_promoted_next_candidate(
+            promoted = Car(
+                source="front",
+                column=next_car.column,
+                color=next_car.color,
+                remain=next_car.remain,
+                x=next_car.x,
+                y=first_car.y,
+            )
+            pair_sim = simulate_flow_closure(
                 grid,
-                candidate,
-                first_car,
-                next_car,
                 parked,
+                [first_car, promoted],
                 slots,
-                occupied_slots,
             )
-            if lookahead is None or lookahead.rejected:
+            if not pair_sim.stable_safe:
                 continue
 
-            candidate.next_vehicle_score = float(lookahead.score)
+            pair_score = _score_flow(
+                pair_sim,
+                occupied_slots=occupied_slots,
+                slots=slots,
+                action_count=2,
+                useful_colors=useful_colors,
+            )
+
+            candidate.next_vehicle_score = float(pair_score)
             candidate.next_vehicle_chain_parked_completions = (
-                lookahead.chain_parked_completions
+                pair_sim.guaranteed_parked_completions
             )
-            candidate.next_vehicle_exact = bool(exact)
+            candidate.next_vehicle_exact = pair_sim.exact_grid
 
-            weight = (
-                _QUEUE_LOOKAHEAD_EXACT_WEIGHT
-                if exact
-                else _QUEUE_LOOKAHEAD_CONSERVATIVE_WEIGHT
+            # 只传播“联合动作比 A 单独更好”的增量，避免 A 的已有收益被重复计算。
+            incremental = max(0.0, pair_score - candidate.score)
+            bonus = incremental * _QUEUE_LOOKAHEAD_WEIGHT
+
+            extra_parked_release = max(
+                0,
+                pair_sim.guaranteed_parked_completions
+                - candidate.chain_parked_completions,
             )
-            bonus = max(0.0, lookahead.score) * weight
-
-            # “B 能确定塞满停车车”属于关键队列解锁，不允许只得到很小的普通前瞻分。
-            if exact and lookahead.chain_parked_completions > 0:
+            if extra_parked_release > 0:
                 bonus = max(
                     bonus,
-                    35000.0 * lookahead.chain_parked_completions
-                    + 0.35 * max(0.0, lookahead.score),
+                    35000.0 * extra_parked_release
+                    + 0.25 * incremental,
                 )
 
             bonus = min(_QUEUE_LOOKAHEAD_BONUS_CAP, bonus)
@@ -377,6 +564,36 @@ def evaluate_candidates(
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates
+
+
+def _candidate_for_promoted_car(
+    grid: np.ndarray,
+    first_car: Car,
+    next_car: Car,
+    parked: Sequence[Car],
+    slots: int,
+    occupied_slots: int,
+    useful_colors: Sequence[int],
+    neighbor_contacts: Dict[int, Counter],
+) -> Candidate:
+    promoted = Car(
+        source="front",
+        column=next_car.column,
+        color=next_car.color,
+        remain=next_car.remain,
+        x=next_car.x,
+        y=first_car.y,
+    )
+    return _build_candidate(
+        grid,
+        promoted,
+        None,
+        parked,
+        slots,
+        occupied_slots,
+        useful_colors,
+        neighbor_contacts,
+    )
 
 
 def choose_two_step_plan(
@@ -389,170 +606,150 @@ def choose_two_step_plan(
     candidates: Sequence[Candidate],
 ) -> Optional[TwoStepPlan]:
     """
-    停车空位 >= 3 时比较两类连续动作：
+    v5.3 连续两步：
 
-    1. 当前第一排 A -> 另一列当前第一排 C；
-    2. 当前第一排 A -> 同列第二排 B（A 点击后 B 顶上）。
-
-    第二类会使用第二排已经可见的浅色数字进行完整容量预测。
-    执行时仍会做一次毫秒级补位确认：只有 B 真正到达第一排、颜色和数字
-    与预测一致才点击；确认失败只执行第一步，然后进入正常分流监控。
+    - 游戏允许分流过程中短暂 6/6，因此最坏两辆新车都留下时，
+      只要点击前至少有 2 个空位，就不会出现 >6 的瞬时占用。
+    - 第一动作仍要求“单独执行也稳定安全”。这是执行层的兜底：
+      同列第二排补位确认若失败，只执行第一步也不会输。
+    - A+B 不是串行 score(A)+score(B)，而是作为并发联合动作一次性跑
+      simulate_flow_closure()，按最终稳定状态评分。
+    - 只有联合动作评分明确高于当前最佳单步，才批量执行。
     """
     free_slots = slots - occupied_slots
-    if free_slots < 3:
+    if free_slots < 2:
         return None
 
     valid_first = [c for c in candidates if not c.rejected]
     if not valid_first:
         return None
 
+    best_single_score = max(c.score for c in valid_first)
     front_by_col = {c.column: c for c in front if c.column is not None}
     next_by_col = {c.column: c for c in nxt if c.column is not None}
-    original_by_col = {c.column: c for c in candidates if c.column is not None}
+
+    _reachable, neighbor_contacts = reachable_summary(grid)
+    active_front_colors = {c.color for c in front if c.color is not None}
+    parked_colors = {c.color for c in parked if c.color is not None}
+    useful_colors = {
+        int(c) for c in (active_front_colors | parked_colors) if c is not None
+    }
 
     best_plan: Optional[TwoStepPlan] = None
+
+    def consider(
+        first: Candidate,
+        second: Candidate,
+        second_source: str,
+        action_cars: Sequence[Car],
+        reason_prefix: str,
+    ) -> None:
+        nonlocal best_plan
+
+        pair_sim = simulate_flow_closure(
+            grid,
+            parked,
+            action_cars,
+            slots,
+        )
+        if not pair_sim.stable_safe:
+            return
+
+        pair_score = _score_flow(
+            pair_sim,
+            occupied_slots=occupied_slots,
+            slots=slots,
+            action_count=2,
+            useful_colors=useful_colors,
+        )
+
+        # 双步必须比当前最优单步有明确增益，否则宁可点击一次后重新观察。
+        if pair_score < best_single_score + _TWO_STEP_MIN_GAIN:
+            return
+
+        reason = (
+            f"{reason_prefix}；A+B 按并发联合动作执行自动分流闭包；"
+            f"稳定后停车占用最坏上界 {pair_sim.final_occupied_upper}/{slots}；"
+            f"保证完成 {pair_sim.guaranteed_completions} 辆，"
+            f"其中已有停车车至少 {pair_sim.guaranteed_parked_completions} 辆；"
+            f"确定性清除色块 {sum(pair_sim.cleared_by_color.values())} 个"
+        )
+        if not pair_sim.exact_grid:
+            reason += "；存在容量不足颜色，其删除位置未知，后续开路按保守下界"
+
+        plan = TwoStepPlan(
+            first=first,
+            second=second,
+            second_source=second_source,
+            score=float(pair_score),
+            free_slots_before=free_slots,
+            first_simulated_exactly=first.flow_exact,
+            reason=reason,
+            guaranteed_completions=pair_sim.guaranteed_completions,
+            guaranteed_parked_completions=pair_sim.guaranteed_parked_completions,
+            cleared_cells=sum(pair_sim.cleared_by_color.values()),
+            final_occupied_upper=pair_sim.final_occupied_upper,
+            flow_exact=pair_sim.exact_grid,
+        )
+        if best_plan is None or plan.score > best_plan.score:
+            best_plan = plan
 
     for first in valid_first:
         first_car = front_by_col.get(first.column)
         if first_car is None:
             continue
 
-        sim_grid, parked_after, occupied_after, exact = _post_first_state(
-            grid,
-            first,
-            first_car,
-            parked,
-            occupied_slots,
-        )
-
-        # Pair 分数里先扣掉 A 已经预支的 B 前瞻奖励，避免同一个 B 被算两遍。
-        first_base_score = first.score - first.queue_unlock_bonus
-
-        # ----- 类型1：另一列当前第一排 -----
-        remaining_front = [car for car in front if car.column != first.column]
-        second_candidates = evaluate_candidates(
-            sim_grid,
-            remaining_front,
-            nxt,
-            parked_after,
-            slots,
-            occupied_after,
-            include_queue_lookahead=False,
-            allow_deterministic_unlock=exact,
-        )
-
-        for second in second_candidates:
-            if second.rejected:
+        # 类型1：当前另一列第一排。两辆都已经确定存在，可直接作为联合动作。
+        for second in valid_first:
+            if second.column == first.column:
                 continue
-
-            # 第一棋盘变化不确定时，同色第二辆的原 reachable 可能被第一辆消耗，跳过。
-            if not exact and second.color == first.color:
+            second_car = front_by_col.get(second.column)
+            if second_car is None:
                 continue
-
-            if (
-                second.reachable <= 0
-                and not second.some_completion_guaranteed
-                and second.chain_parked_completions <= 0
-            ):
-                continue
-
-            reason_parts: List[str] = []
-            original_second = original_by_col.get(second.column)
-            improvement = 0.0
-            if original_second is not None:
-                improvement = second.score - (
-                    original_second.score - original_second.queue_unlock_bonus
-                )
-
-            pair_score = (
-                first_base_score
-                + 0.92 * second.score
-                + 0.20 * first.queue_unlock_bonus
+            consider(
+                first,
+                second,
+                "front",
+                [first_car, second_car],
+                "第二步为当前另一列第一排车辆",
             )
 
-            if exact and improvement > 0:
-                pair_score += 0.30 * improvement
-                reason_parts.append("第一步确定状态后第二步评分提高")
-
-            if (
-                not first.self_clear_guaranteed
-                and not first.some_completion_guaranteed
-                and first.chain_parked_completions <= 0
-            ):
-                pair_score -= 700.0
-            if (
-                not second.self_clear_guaranteed
-                and not second.some_completion_guaranteed
-                and second.chain_parked_completions <= 0
-            ):
-                pair_score -= 500.0
-
-            if not reason_parts:
-                reason_parts.append(
-                    "第一步后按确定棋盘评价另一列"
-                    if exact
-                    else "第一步位置不唯一，第二步只使用保守即时收益"
-                )
-
-            plan = TwoStepPlan(
-                first=first,
-                second=second,
-                second_source="front",
-                score=float(pair_score),
-                free_slots_before=free_slots,
-                first_simulated_exactly=exact,
-                reason="；".join(reason_parts),
-            )
-            if best_plan is None or plan.score > best_plan.score:
-                best_plan = plan
-
-        # ----- 类型2：同列第二排顶上 -----
+        # 类型2：同列第二排 B。B 会在 A 离开第一排后立即顶上，
+        # 执行层仍用颜色+数字快速确认后才点击。
         next_car = next_by_col.get(first.column)
-        promoted, promoted_exact = _evaluate_promoted_next_candidate(
+        if (
+            next_car is None
+            or next_car.color is None
+            or next_car.remain is None
+            or next_car.column is None
+        ):
+            continue
+
+        promoted_candidate = _candidate_for_promoted_car(
             grid,
-            first,
             first_car,
             next_car,
             parked,
             slots,
             occupied_slots,
+            useful_colors,
+            neighbor_contacts,
         )
-
-        if promoted is not None and not promoted.rejected:
-            if (
-                promoted.reachable > 0
-                or promoted.some_completion_guaranteed
-                or promoted.chain_parked_completions > 0
-            ):
-                pair_score = first_base_score + 0.97 * promoted.score
-                reason_parts = [
-                    "第一步会确定让同列第二排车辆顶到第一排"
-                ]
-
-                if promoted_exact:
-                    reason_parts.append("第一步后的棋盘/停车状态可确定模拟")
-                else:
-                    reason_parts.append("棋盘变化不唯一，仅采用第二辆保守即时收益")
-
-                if promoted.chain_parked_completions > 0:
-                    pair_score += 8000.0 * promoted.chain_parked_completions
-                    reason_parts.append(
-                        f"第二辆可确定连锁完成停车车 {promoted.chain_parked_completions} 辆"
-                    )
-                elif promoted.self_clear_guaranteed:
-                    reason_parts.append("第二辆可确定自己装满")
-
-                plan = TwoStepPlan(
-                    first=first,
-                    second=promoted,
-                    second_source="next",
-                    score=float(pair_score),
-                    free_slots_before=free_slots,
-                    first_simulated_exactly=promoted_exact,
-                    reason="；".join(reason_parts),
-                )
-                if best_plan is None or plan.score > best_plan.score:
-                    best_plan = plan
+        promoted_car = Car(
+            source="front",
+            column=next_car.column,
+            color=next_car.color,
+            remain=next_car.remain,
+            x=next_car.x,
+            y=first_car.y,
+        )
+        consider(
+            first,
+            promoted_candidate,
+            "next",
+            [first_car, promoted_car],
+            "第一步离开队列后，同列第二排立即补位",
+        )
 
     return best_plan
 
@@ -564,7 +761,7 @@ def format_two_step_plan(plan: Optional[TwoStepPlan]) -> str:
     if plan.second_source == "next":
         second_text = (
             f"随后等待同列第二排 {ctag(plan.second.color)}×{plan.second.capacity} "
-            "顶到第一排，快速确认后立即点击"
+            "顶到第一排，颜色+数字确认后立即点击"
         )
     else:
         second_text = (
@@ -572,11 +769,16 @@ def format_two_step_plan(plan: Optional[TwoStepPlan]) -> str:
             f"{ctag(plan.second.color)}×{plan.second.capacity}"
         )
 
+    exact_text = "确定性闭包" if plan.flow_exact else "保守闭包"
     return (
-        f"连续两步计划: 当前空位 {plan.free_slots_before} >= 3，"
+        f"连续两步计划: 当前空位 {plan.free_slots_before} >= 2，"
         f"先点击第{plan.first.column}列 {ctag(plan.first.color)}×{plan.first.capacity}；"
         f"{second_text}。\n"
-        f"两步预测依据: {plan.reason}；pair_score={plan.score:.1f}"
+        f"联合动作预测: {exact_text}；稳定后停车占用上界 "
+        f"{plan.final_occupied_upper}；保证完成 {plan.guaranteed_completions} 辆，"
+        f"已有停车车至少完成 {plan.guaranteed_parked_completions} 辆；"
+        f"确定性清除 {plan.cleared_cells} 个色块；pair_score={plan.score:.1f}\n"
+        f"两步预测依据: {plan.reason}"
     )
 
 
@@ -612,7 +814,11 @@ def format_report(
     if reachable:
         reach_text = ", ".join(
             f"{ctag(c)}={n}"
-            for c, n in sorted(reachable.items(), key=lambda kv: kv[1], reverse=True)
+            for c, n in sorted(
+                reachable.items(),
+                key=lambda kv: kv[1],
+                reverse=True,
+            )
         )
         lines.append(f"当前从下方可连续触达: {reach_text}")
     else:
@@ -654,38 +860,33 @@ def format_report(
         )
 
     lines.append("")
-    lines.append("候选动作:")
+    lines.append("候选动作（按并发自动分流闭包评分）:")
     for c in candidates:
         flags: List[str] = []
+
         if c.self_clear_guaranteed:
-            flags.append("确定自己装满消失")
-        elif c.some_completion_guaranteed:
-            flags.append(f"确定至少消失 {c.guaranteed_completions} 辆同色车")
+            flags.append("确定该点击车自己装满")
+        if c.guaranteed_completions > 0:
+            flags.append(f"闭包保证完成 {c.guaranteed_completions} 辆")
         if c.chain_parked_completions > 0:
             detail = ", ".join(
                 f"{ctag(color)}×{count}"
                 for color, count in c.chain_parked_completion_by_color.items()
             )
             flags.append(
-                f"确定连锁塞满停车车 {c.chain_parked_completions} 辆"
+                f"已有停车车至少完成 {c.chain_parked_completions} 辆"
                 + (f"（{detail}）" if detail else "")
             )
         if c.deterministic_clear_reachable:
-            flags.append("确定清空当前可达该色")
-        if c.next_color_newly_reachable > 0:
-            flags.append(f"确定新开下一辆颜色 +{c.next_color_newly_reachable}")
+            flags.append("同色总容量可确定清空当前可达该色")
         if c.queue_unlock_bonus > 0 and c.next_capacity is not None:
-            exact_text = "确定状态" if c.next_vehicle_exact else "保守状态"
             flags.append(
-                f"解锁第二排前瞻 +{c.queue_unlock_bonus:.0f}（{exact_text}）"
+                f"同列第二排联合前瞻 +{c.queue_unlock_bonus:.0f}"
+                f"（{'确定' if c.next_vehicle_exact else '保守'}闭包）"
             )
-            if c.next_vehicle_chain_parked_completions > 0:
-                flags.append(
-                    f"第二辆预计保证释放停车车 {c.next_vehicle_chain_parked_completions} 辆"
-                )
         if c.rejected:
-            flags.append("硬禁止")
-        if c.next_color:
+            flags.append("稳定状态硬禁止")
+        if c.next_color is not None:
             if c.next_capacity is not None:
                 flags.append(f"第二排 {ctag(c.next_color)}×{c.next_capacity}")
             else:
@@ -693,85 +894,68 @@ def format_report(
 
         lines.append(
             f"  第{c.column}列 {ctag(c.color)}×{c.capacity}: "
-            f"可触达={c.reachable}, score={c.score:.1f}"
+            f"可触达={c.reachable}, score={c.score:.1f}, "
+            f"闭包清除={c.flow_cleared_cells}, "
+            f"稳定占用上界={c.flow_final_occupied_upper}/{slots}"
             + (" | " + "；".join(flags) if flags else "")
         )
+
         if c.unlocked_by_color:
-            unlock_text = ", ".join(
+            exposure_text = ", ".join(
                 f"{ctag(k)}+{v}" for k, v in c.unlocked_by_color.items()
             )
-            lines.append(f"      一层确定性模拟新暴露: {unlock_text}")
+            lines.append(f"      闭包过程中确定新暴露: {exposure_text}")
+
         if c.queue_unlock_bonus > 0:
             lines.append(
-                f"      二层队列前瞻: 第二辆基础评分 {c.next_vehicle_score:.1f}，"
-                f"折算到第一辆 +{c.queue_unlock_bonus:.1f}"
+                f"      第二排联合动作评分 {c.next_vehicle_score:.1f}；"
+                f"只把相对当前动作的增量折算 +{c.queue_unlock_bonus:.1f}，"
+                "避免重复使用同一批新暴露色块。"
             )
+
+        if not c.flow_exact:
+            lines.append(
+                "      闭包说明: 至少一种颜色容量不足以清空当前可达区，"
+                "具体删除位置未知；后续开路只按保守下界计算。"
+            )
+
         if c.rejected:
             lines.append(f"      原因: {c.reject_reason}")
 
     valid = [c for c in candidates if not c.rejected]
     lines.append("")
     if not valid:
-        lines.append("建议: 不点击。当前没有满足硬安全约束的候选动作。")
+        lines.append("建议: 不点击。当前没有满足稳定状态硬安全约束的单步候选。")
     else:
-        best = valid[0]
+        best = max(valid, key=lambda c: c.score)
         lines.append(
             f"下一步建议: 点击【第一排第 {best.column} 列】 "
             f"{ctag(best.color)} / 数字 {best.capacity}"
         )
-        if (
-            best.queue_unlock_bonus > 0
-            and best.next_vehicle_chain_parked_completions > 0
-            and best.next_capacity is not None
-        ):
-            mode = "确定性状态" if best.next_vehicle_exact else "保守状态"
+        lines.append(
+            "程序依据: 以本次点击车与已有停车车作为并发活跃车辆，"
+            "持续执行“可达同色自动吸收 → 可证明清层 → 新颜色暴露 → "
+            "停车车继续自动吸收”的闭包直到稳定；"
+            f"稳定后停车占用最坏上界 {best.flow_final_occupied_upper}/{slots}，"
+            f"确定性清除 {best.flow_cleared_cells} 个色块。"
+        )
+        if best.chain_parked_completions > 0:
             lines.append(
-                f"程序依据: 当前车同时承担队列开门作用；点击后会让同列第二排 "
-                f"{ctag(best.next_color)}×{best.next_capacity} 顶上。按{mode}二层预测，"
-                f"第二辆可保证连锁释放停车车 "
-                f"{best.next_vehicle_chain_parked_completions} 辆，因此已把该关键后续收益反向计入第一辆。"
+                f"停车释放依据: 不假设同色分配顺序，按最坏分配仍保证已有停车车 "
+                f"至少完成 {best.chain_parked_completions} 辆。"
             )
-        elif best.chain_parked_completions > 0:
-            chain_text = ", ".join(
-                f"{ctag(color)} 至少完成 {count} 辆"
-                for color, count in best.chain_parked_completion_by_color.items()
-            )
-            extra = "；点击车辆本身也确定装满消失" if best.self_clear_guaranteed else ""
+        if best.queue_unlock_bonus > 0 and best.next_capacity is not None:
             lines.append(
-                "程序依据: 一层确定性模拟表明，该动作新释放的小方块按最坏分配"
-                f"仍可保证停车区已有车辆完成：{chain_text}{extra}。"
+                f"队列依据: 点击后同列第二排 {ctag(best.next_color)}×"
+                f"{best.next_capacity} 会立即补位；A+B 已按并发联合动作重新模拟，"
+                f"只传播联合动作相对 A 的增量价值 +{best.queue_unlock_bonus:.0f}。"
             )
-        elif best.queue_unlock_bonus > 0 and best.next_capacity is not None:
-            lines.append(
-                f"程序依据: 除当前动作收益外，点击后同列第二排 "
-                f"{ctag(best.next_color)}×{best.next_capacity} 会立即成为可点击车；"
-                f"其二层前瞻价值已折算 +{best.queue_unlock_bonus:.0f} 分。"
-            )
-        elif best.next_color_newly_reachable > 0:
-            lines.append(
-                f"程序依据: 一层确定性模拟表明，该动作会把下一辆 {ctag(best.next_color)} "
-                f"对应颜色新增暴露 {best.next_color_newly_reachable} 个。"
-            )
-        elif best.self_clear_guaranteed:
-            lines.append(
-                f"程序依据: 当前确定可触达 {best.reachable} 个同类色块 >= {best.capacity}，"
-                "且停车区没有检测到同色分流车，因此可确定该车装满并消失。"
-            )
-        elif best.some_completion_guaranteed:
-            lines.append(
-                f"程序依据: 不预测同色分流位置，但按最坏分配仍可保证至少 "
-                f"{best.guaranteed_completions} 辆同色车消失。"
-            )
-        else:
-            lines.append(
-                "程序依据: 该动作通过停车位硬安全检查，并在当前确定性解锁、"
-                "队列二层前瞻与启发式评分中最高。"
-            )
+
     return "\n".join(lines)
 
 
 def best_valid_candidate(candidates: Sequence[Candidate]) -> Optional[Candidate]:
-    for candidate in candidates:
-        if not candidate.rejected:
-            return candidate
-    return None
+    valid = [candidate for candidate in candidates if not candidate.rejected]
+    if not valid:
+        return None
+    return max(valid, key=lambda c: c.score)
