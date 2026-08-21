@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+
+# 运行时产物：ADB 截图与持久化状态
+solver_shots/
+solver_state.npz
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
