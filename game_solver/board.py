@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -42,6 +43,44 @@ _INCREMENTAL_BG_FALLBACK_X1_N = 0.22
 _INCREMENTAL_BG_FALLBACK_X2_N = 0.78
 _INCREMENTAL_BG_FALLBACK_Y1_N = 0.515
 _INCREMENTAL_BG_FALLBACK_Y2_N = 0.545
+
+
+@dataclass
+class CausalBoardUpdate:
+    """
+    一轮真实分流结束后的因果棋盘更新结果。
+
+    expected_by_color:
+        根据“上一稳定状态的停车剩余 + 本轮实际点击车辆容量 - 下一稳定状态停车剩余”
+        计算出的、本轮每种颜色确定实际吸收数量。
+
+    confirmed_by_color:
+        在拓扑允许的位置上，由当前稳定截图明确落实为 EMPTY 的数量。
+
+    remaining_by_color:
+        数学上应该已经消失、但视觉/拓扑尚未能落实的位置数量。
+        非空时进入观测重试；持续无法落实时由运行时安全状态机降级处理。
+
+    excess_by_color:
+        当前截图在拓扑 frontier 上显示为 EMPTY 的同色格数量超过实际吸收预算。
+        这通常意味着旧 grid 颜色分类、OCR 容量或当前截图存在矛盾；该颜色应被隔离，不能猜位置。
+    """
+    grid: np.ndarray
+    removed: int
+    expected_by_color: Dict[int, int]
+    confirmed_by_color: Dict[int, int]
+    remaining_by_color: Dict[int, int]
+    excess_by_color: Dict[int, int]
+    invalid_reason: str
+    checked_cells: int
+
+    @property
+    def complete(self) -> bool:
+        return (
+            not self.invalid_reason
+            and not self.remaining_by_color
+            and not self.excess_by_color
+        )
 
 
 def ctag(color: Optional[int]) -> str:
@@ -383,6 +422,186 @@ def _recover_unknown_color(
     if float(d[idx]) < _INCREMENTAL_UNKNOWN_RECOVER_DIST:
         return 1 + idx
     return None
+
+
+def update_grid_causal(
+    prev: np.ndarray,
+    image_rgb: np.ndarray,
+    palette: np.ndarray,
+    consumed_by_color: Dict[int, int],
+) -> CausalBoardUpdate:
+    """
+    使用“本轮真实吸收数量”驱动棋盘位置更新。
+
+    核心原则：
+      1) 数量不再由截图猜测，而由车辆容量守恒决定；
+      2) 截图只回答“这些确定消失的格子具体在哪里”；
+      3) 只有从棋盘下方开放区逐层接触到的 frontier 才有资格消失；
+      4) 只有当前仍有该颜色 consumption budget 的格子才允许 COLOR -> EMPTY；
+      5) 必须明确看到棋盘背景才提交 EMPTY；
+      6) 若数学预算没有全部落实，或视觉发现的空格超过预算，不猜位置；交给运行时重试/降级。
+
+    consumed_by_color 只应包含 >0 的确定实际吸收量。
+    """
+    if prev.shape != (GRID_ROWS, GRID_COLS):
+        raise ValueError(
+            f"棋盘状态尺寸异常: {prev.shape}，期望 {(GRID_ROWS, GRID_COLS)}"
+        )
+
+    expected: Dict[int, int] = {
+        int(color): int(count)
+        for color, count in consumed_by_color.items()
+        if int(color) > 0 and int(count) > 0
+    }
+
+    # 本轮没有任何实际吸收时，棋盘不能发生 COLOR -> EMPTY。
+    if not expected:
+        return CausalBoardUpdate(
+            grid=prev.copy(),
+            removed=0,
+            expected_by_color={},
+            confirmed_by_color={},
+            remaining_by_color={},
+            excess_by_color={},
+            invalid_reason="",
+            checked_cells=0,
+        )
+
+    grid = prev.copy()
+    background_rgb = _estimate_background_rgb(prev, image_rgb)
+
+    remaining = dict(expected)
+    confirmed: Dict[int, int] = defaultdict(int)
+    excess: Dict[int, int] = defaultdict(int)
+    checked_cells = 0
+
+    # 对同一稳定截图中已经判断为“仍存在/无法确认”的格子不重复采样；
+    # 当其邻接关系因其它格子被清空而改变时，它本身像素并不会改变，
+    # 因此再次采样没有价值。
+    settled: Set[Tuple[int, int]] = set()
+
+    for _round in range(GRID_ROWS * GRID_COLS + 1):
+        frontier = _frontier_cells(grid)
+        pending = [
+            pos
+            for pos in sorted(frontier)
+            if pos not in settled
+        ]
+        if not pending:
+            break
+
+        newly_removed = 0
+
+        # 先收集这一层“明确已经是背景”的候选，再按颜色预算提交。
+        empty_candidates_by_color: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+
+        for r, c in pending:
+            old = int(grid[r, c])
+            if old <= 0:
+                settled.add((r, c))
+                continue
+
+            # 本轮该颜色没有任何实际吸收预算，则不需要读取这个格子：
+            # 它在物理上不可能因为本轮动作而消失。
+            if old not in expected:
+                settled.add((r, c))
+                continue
+
+            cx, cy = _grid_cell_center(
+                r,
+                c,
+                image_rgb.shape[1],
+                image_rgb.shape[0],
+            )
+            if ui_covered(
+                cx,
+                cy,
+                image_rgb.shape[1],
+                image_rgb.shape[0],
+            ):
+                settled.add((r, c))
+                continue
+
+            rgb = _sample_grid_cell(image_rgb, r, c)
+            checked_cells += 1
+
+            # 明确仍是原颜色 -> 保留。
+            if old - 1 < len(palette):
+                ref = palette[old - 1]
+                if float(np.linalg.norm(rgb - ref)) < KEEP_COLOR_DIST:
+                    settled.add((r, c))
+                    continue
+
+            # 只有明确看到棋盘背景才把它列入“本层真实空格”。
+            if _looks_like_empty_background(rgb, background_rgb, palette):
+                empty_candidates_by_color[old].append((r, c))
+                continue
+
+            # 既不像旧颜色又不像背景：通知/动画/高光/其它 UI。
+            # 不允许因此修改持久化状态。
+            settled.add((r, c))
+
+        for color, positions in sorted(empty_candidates_by_color.items()):
+            budget = int(remaining.get(color, 0))
+            if budget <= 0:
+                # 数学上该颜色本轮已经没有剩余吸收量，
+                # 但又在新的拓扑 frontier 发现明确背景，属于硬矛盾。
+                excess[color] += len(positions)
+                settled.update(positions)
+                continue
+
+            if len(positions) > budget:
+                # 视觉在同一层看到了比容量守恒允许值更多的“空格”。
+                #
+                # 旧版会任意挑 budget 个提交，这虽然数量守恒，却不能证明
+                # 具体是哪几个位置真实属于本轮消失，可能把颜色误分类继续写进状态。
+                #
+                # v5.6：该颜色这一层一个都不猜；整组隔离为不可信，预算保留给
+                # 下一张稳定截图/后续重同步。其它颜色仍可正常提交。
+                excess[color] += len(positions) - budget
+                settled.update(positions)
+                continue
+
+            for r, c in positions:
+                grid[r, c] = EMPTY
+                confirmed[color] += 1
+                remaining[color] -= 1
+                newly_removed += 1
+
+        # 所有预算已经落实，不必继续扫描。
+        if all(v <= 0 for v in remaining.values()):
+            break
+
+        # 没有新 EMPTY，拓扑无法继续推进；剩余预算留给 incomplete 报告。
+        if newly_removed == 0:
+            break
+
+    remaining_nonzero = {
+        color: count
+        for color, count in sorted(remaining.items())
+        if count > 0
+    }
+    excess_nonzero = {
+        color: count
+        for color, count in sorted(excess.items())
+        if count > 0
+    }
+
+    invalid_reason = ""
+    if background_rgb is None:
+        invalid_reason = "无法可靠估计棋盘 EMPTY 背景色"
+
+    return CausalBoardUpdate(
+        grid=grid,
+        removed=sum(confirmed.values()),
+        expected_by_color=dict(sorted(expected.items())),
+        confirmed_by_color=dict(sorted(confirmed.items())),
+        remaining_by_color=remaining_nonzero,
+        excess_by_color=excess_nonzero,
+        invalid_reason=invalid_reason,
+        checked_cells=checked_cells,
+    )
+
 
 
 def update_grid(

@@ -11,7 +11,7 @@ from .engine import analyze_image, run_auto_flow_mode, run_manual_step_mode
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="游戏截图滚动求解器 v5.4：拓扑增量棋盘 + 游戏字形OCR + 分流闭包验真"
+        description="游戏截图滚动求解器 v5.6：因果棋盘 + 分级安全状态机 + 保守自动恢复"
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--adb", action="store_true", help="使用 ADB")
@@ -130,6 +130,29 @@ def main() -> int:
         help="停车监控结束到下一轮重新截图前的收尾等待，默认 0.35 秒",
     )
     parser.add_argument(
+        "--observation-retries",
+        type=int,
+        default=3,
+        help=(
+            "棋盘因果更新/OCR观测异常时，当前轮最多重新截图确认次数，默认 3。"
+            "重试期间绝不点击。"
+        ),
+    )
+    parser.add_argument(
+        "--observation-retry-delay",
+        type=float,
+        default=0.45,
+        help="RETRY_OBSERVATION 两次截图之间等待秒数，默认 0.45",
+    )
+    parser.add_argument(
+        "--safe-pause-retry-delay",
+        type=float,
+        default=1.0,
+        help=(
+            "PAUSED_SAFE 状态下不点击、仅重新截图分析的等待间隔，默认 1 秒"
+        ),
+    )
+    parser.add_argument(
         "--no-display",
         action="store_true",
         help="关闭运行状态展示窗口",
@@ -184,6 +207,8 @@ def main() -> int:
         "empty_settle_delay",
         "queue_empty_confirm_delay",
         "analysis_settle_delay",
+        "observation_retry_delay",
+        "safe_pause_retry_delay",
         "unlock_ad_wait",
         "unlock_return_settle_delay",
     ):
@@ -198,6 +223,8 @@ def main() -> int:
         parser.error("--parking-idle-timeout 必须 > 0")
     if args.monitor_max_failures < 1:
         parser.error("--monitor-max-failures 必须 >= 1")
+    if args.observation_retries < 1:
+        parser.error("--observation-retries 必须 >= 1")
     if args.display_width < 320:
         parser.error("--display-width 必须 >= 320")
     if args.display_height < 480:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -93,3 +93,14 @@ class AnalysisResult:
     front_number_cache: Dict[int, FrontNumberCacheEntry]
     front_ocr_reads: int
     two_step_plan: Optional[TwoStepPlan]
+
+    # v5.6：安全降级状态机需要的结构化诊断。
+    board_update_status: str = "ok"  # ok / incomplete / causal_invalid
+    board_update_remaining_by_color: Dict[int, int] = field(default_factory=dict)
+    board_update_excess_by_color: Dict[int, int] = field(default_factory=dict)
+    causal_input_invalid: str = ""
+    model_conflict_colors: List[int] = field(default_factory=list)
+    strategy_untrusted_colors: List[int] = field(default_factory=list)
+    guarantee_broken: bool = False
+    guarantee_expected_upper: Optional[int] = None
+    state_saved: bool = True
