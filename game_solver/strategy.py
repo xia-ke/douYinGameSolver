@@ -14,6 +14,7 @@ from .models import Car, Candidate, TwoStepPlan
 _QUEUE_LOOKAHEAD_WEIGHT = 0.70
 _QUEUE_LOOKAHEAD_BONUS_CAP = 120000.0
 _TWO_STEP_MIN_GAIN = 4000.0
+_TWO_STEP_MIN_FREE_SLOTS = 3
 
 
 @dataclass
@@ -636,7 +637,11 @@ def choose_two_step_plan(
     - 只有联合动作评分明确高于当前最佳单步，才批量执行。
     """
     free_slots = slots - occupied_slots
-    if free_slots < 2:
+    # v5.17: two-step cadence is enabled only with >=3 free slots.
+    # With two clicks, even the worst case where neither car completes
+    # can occupy at most slots-1, so soft model warnings do not need to
+    # collapse execution to single-step in this spacious state.
+    if free_slots < _TWO_STEP_MIN_FREE_SLOTS:
         return None
 
     # v5.12 hard safety: 第一动作单独执行也必须稳定安全。
@@ -792,7 +797,8 @@ def format_two_step_plan(plan: Optional[TwoStepPlan]) -> str:
 
     exact_text = "确定性闭包" if plan.flow_exact else "保守闭包"
     return (
-        f"连续两步计划: 当前空位 {plan.free_slots_before} >= 2，"
+        f"连续两步计划: 当前空位 {plan.free_slots_before} >= "
+        f"{_TWO_STEP_MIN_FREE_SLOTS}，"
         f"先点击第{plan.first.column}列 {ctag(plan.first.color)}×{plan.first.capacity}；"
         f"{second_text}。\n"
         f"联合动作预测: {exact_text}；稳定后停车占用上界 "

@@ -685,8 +685,8 @@ def _actual_consumed_from_capacity_delta(
 def _format_causal_board_update(
     update: CausalBoardUpdate,
 ) -> str:
-    if not update.expected_by_color and update.complete:
-        return "因果棋盘更新: 本轮容量守恒确认没有色块被吸收，棋盘不应发生消失。"
+    if not update.expected_by_color and update.complete and update.removed == 0:
+        return "视觉棋盘更新: 本轮没有新的视觉 EMPTY，也没有容量变化。"
 
     expected = ", ".join(
         f"{ctag(color)}={count}"
@@ -698,10 +698,10 @@ def _format_causal_board_update(
     ) or "无"
 
     lines = [
-        "因果棋盘更新:",
-        f"  数学确定实际吸收: {expected}",
-        f"  拓扑+截图已落实为空: {confirmed}",
-        f"  本轮检查 reachable 同色连通块候选 {update.checked_cells} 个格子",
+        "视觉棋盘更新:",
+        f"  容量守恒审计值: {expected}",
+        f"  当前稳定截图明确识别为空: {confirmed}",
+        f"  本轮全棋盘视觉复核 {update.checked_cells} 个已知色块",
         (
             "  temporal snapshot: "
             + ("可用" if update.temporal_snapshot_available else "不可用（退回背景判定）")
@@ -741,7 +741,7 @@ def _format_causal_board_update(
             for color, count
             in update.strong_nonfrontier_confirmed_by_color.items()
         )
-        lines.append(f"  强视觉非frontier确认: {strong}")
+        lines.append(f"  历史/零容量视觉纠错: {strong}")
 
     if update.ui_unknown_confirmed_by_color:
         ui_unknown = ", ".join(
@@ -757,7 +757,7 @@ def _format_causal_board_update(
             for color, count in update.ambiguous_changed_by_color.items()
         )
         lines.append(
-            "  额外变化候选（仅telemetry，容量数学已裁剪）: "
+            "  额外视觉候选（仅telemetry，未按容量裁剪）: "
             + ambiguous
         )
 
@@ -766,14 +766,14 @@ def _format_causal_board_update(
             f"{ctag(color)}缺{count}"
             for color, count in update.remaining_by_color.items()
         )
-        lines.append(f"  未落实预算: {missing}")
+        lines.append(f"  容量大于视觉确认（疑似OCR/遮挡/未稳定）: {missing}")
 
     if update.excess_by_color:
         excess = ", ".join(
             f"{ctag(color)}多{count}"
             for color, count in update.excess_by_color.items()
         )
-        lines.append(f"  超预算空格: {excess}")
+        lines.append(f"  视觉确认大于容量（疑似历史ghost/OCR误差）: {excess}")
 
     if update.invalid_reason:
         lines.append(f"  更新异常: {update.invalid_reason}")
@@ -1001,13 +1001,26 @@ def analyze_image(
 
     strategy_grid = grid.copy()
 
-    # 异常状态下最多降为单步实验，避免一次叠加过多变量；
-    # 但绝不阻止游戏继续点击。
-    local_force_single = bool(
+    # v5.17: soft safety warnings no longer blanket-disable two-step.
+    #
+    # When there are >=3 free parking slots, executing two cars can occupy at
+    # most slots-1 even if neither completes. Therefore MODEL_INCONSISTENT,
+    # GUARANTEE_BROKEN, board-sync telemetry and the runtime conservative flag
+    # are not reasons by themselves to skip the normal two-step cadence.
+    #
+    # With fewer than 3 free slots, keep the old single-step degradation so the
+    # solver re-observes after every click. Candidate.rejected and the pair
+    # stable_safe check remain hard safety gates in strategy.py.
+    free_slots = max(0, int(slots) - int(occupied_slots))
+    soft_force_single = bool(
         force_single_step
         or guarantee_broken
         or stable_conflicts
         or board_update_status != "ok"
+    )
+    local_force_single = bool(
+        soft_force_single
+        and free_slots < 3
     )
 
     candidates = evaluate_candidates(
@@ -1049,6 +1062,14 @@ def analyze_image(
     if causal_update is not None:
         report += "\n\n" + _format_causal_board_update(causal_update)
 
+    if soft_force_single and not local_force_single:
+        report += (
+            "\n\n[TWO_STEP_POLICY]\n"
+            f"当前空停车位 {free_slots} >= 3；软安全告警不再强制降为单步。"
+            "连续两步仍必须满足：第一步非 rejected、联合动作 stable_safe，"
+            "并通过正常两步评分与执行确认。"
+        )
+
     if causal_input_invalid:
         report += (
             "\n\n!!! CAUSAL_CAPACITY_INVALID / RETRY_OBSERVATION !!!\n"
@@ -1071,9 +1092,9 @@ def analyze_image(
         )
         report += (
             "\n\n!!! BOARD_UPDATE_INCOMPLETE / EXPERIMENT_WARNING !!!\n"
-            "容量守恒预算尚未完整落实到具体格子。"
+            "容量守恒审计值与视觉空间识别不一致。"
             "实验模式会提交当前已确认的保守棋盘并继续单步运行；"
-            "未落实数量只写入日志，不跨动作 carry，也不阻止下一次点击。"
+            "不按容量猜测格子位置；差异只写入日志，不跨动作 carry，也不阻止下一次点击。"
             f"\n问题颜色: "
             f"{', '.join(ctag(c) for c in problem_colors) or '未知'}"
         )
