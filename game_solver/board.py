@@ -37,6 +37,16 @@ _INCREMENTAL_EMPTY_BG_DIST = 34.0
 _INCREMENTAL_EMPTY_PALETTE_MARGIN = 44.0
 _INCREMENTAL_BG_SAMPLE_LIMIT = 256
 
+# v5.9 temporal causal sync
+#
+# 容量守恒已经告诉我们“本轮某颜色实际消失多少格”，因此稳定截图中
+# 不需要每个已吸收格都必须露出纯灰背景；只要：
+#   - 该格属于上一 committed state 的当前 reachable 同色连通块；
+#   - 与上一 committed 稳定截图相比发生了明显视觉变化；
+# 就可以作为因果删除证据。
+_CAUSAL_TEMPORAL_CHANGE_DIST = 18.0
+_CAUSAL_TEMPORAL_STRONG_CHANGE_DIST = 32.0
+
 # 当已存在 EMPTY 很少时，使用棋盘下缘和停车区之间的灰色游戏背景估计背景色。
 # 这些比例针对整个截图而不是棋盘网格；只作为首轮/极少 EMPTY 时的兜底。
 _INCREMENTAL_BG_FALLBACK_X1_N = 0.22
@@ -62,7 +72,7 @@ class CausalBoardUpdate:
         非空时进入观测重试；持续无法落实时由运行时安全状态机降级处理。
 
     excess_by_color:
-        当前截图在拓扑 frontier 上显示为 EMPTY 的同色格数量超过实际吸收预算。
+        当前截图在 reachable 同色连通块中显示为 EMPTY 的格数量超过实际吸收预算。
         这通常意味着旧 grid 颜色分类、OCR 容量或当前截图存在矛盾；该颜色应被隔离，不能猜位置。
     """
     grid: np.ndarray
@@ -73,6 +83,13 @@ class CausalBoardUpdate:
     excess_by_color: Dict[int, int]
     invalid_reason: str
     checked_cells: int
+
+    # v5.9 诊断：同一 committed stable frame -> current stable frame 的时间差分。
+    temporal_confirmed_by_color: Dict[int, int]
+    background_confirmed_by_color: Dict[int, int]
+    ambiguous_changed_by_color: Dict[int, int]
+    temporal_change_threshold: float
+    temporal_snapshot_available: bool
 
     @property
     def complete(self) -> bool:
@@ -131,6 +148,22 @@ def _sample_grid_cell(
     h, w = image_rgb.shape[:2]
     x, y = _grid_cell_center(r, c, w, h)
     return sample_center_2x2(image_rgb, x, y).astype(np.float32)
+
+
+
+def sample_grid_rgb_snapshot(image_rgb: np.ndarray) -> np.ndarray:
+    """
+    一次性采样 52x38 个逻辑格子的中心 RGB。
+
+    该快照跟随“已提交稳定状态”持久化。下一次动作完成后用 current-prev
+    时间差分判断哪些物理可达格确实发生了变化，从而避免把
+    “必须露出纯灰背景”当成唯一 COLOR->EMPTY 证据。
+    """
+    snap = np.empty((GRID_ROWS, GRID_COLS, 3), dtype=np.float32)
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            snap[r, c] = _sample_grid_cell(image_rgb, r, c)
+    return snap
 
 
 def ui_covered(x: float, y: float, w: int, h: int) -> bool:
@@ -429,19 +462,23 @@ def update_grid_causal(
     image_rgb: np.ndarray,
     palette: np.ndarray,
     consumed_by_color: Dict[int, int],
+    prev_grid_rgb: Optional[np.ndarray] = None,
 ) -> CausalBoardUpdate:
     """
-    使用“本轮真实吸收数量”驱动棋盘位置更新。
+    使用“容量守恒 + committed stable frame 时间差分”更新棋盘。
 
-    核心原则：
-      1) 数量不再由截图猜测，而由车辆容量守恒决定；
-      2) 截图只回答“这些确定消失的格子具体在哪里”；
-      3) 只有从棋盘下方开放区逐层接触到的 frontier 才有资格消失；
-      4) 只有当前仍有该颜色 consumption budget 的格子才允许 COLOR -> EMPTY；
-      5) 必须明确看到棋盘背景才提交 EMPTY；
-      6) 若数学预算没有全部落实，或视觉发现的空格超过预算，不猜位置；交给运行时重试/降级。
+    v5.9 修正两个已由真实日志/截图证明的问题：
 
-    consumed_by_color 只应包含 >0 的确定实际吸收量。
+    1) 不再要求所有被吸收格都必须露出纯灰背景。
+       底部 sprite 的脚/阴影/相邻块覆盖会让逻辑格已消失，但中心采样仍非灰色。
+       若某格属于当前 reachable 同色 component，且相对上一 committed 稳定截图
+       发生明显视觉变化，则它也是有效的 causal removal evidence。
+
+    2) update_grid_causal 本身完全纯函数化：
+       它只基于传入的 prev / prev_grid_rgb 生成 candidate grid，不写持久化状态。
+       观测重试必须始终从同一个 committed state 重新计算。
+
+    数量仍由 consumed_by_color 决定；视觉只负责在物理可达候选中定位具体位置。
     """
     if prev.shape != (GRID_ROWS, GRID_COLS):
         raise ValueError(
@@ -454,125 +491,176 @@ def update_grid_causal(
         if int(color) > 0 and int(count) > 0
     }
 
-    # 本轮没有任何实际吸收时，棋盘不能发生 COLOR -> EMPTY。
-    if not expected:
+    current_grid_rgb = sample_grid_rgb_snapshot(image_rgb)
+
+    snapshot_ok = (
+        prev_grid_rgb is not None
+        and np.asarray(prev_grid_rgb).shape == (GRID_ROWS, GRID_COLS, 3)
+    )
+    previous_rgb = (
+        np.asarray(prev_grid_rgb, dtype=np.float32)
+        if snapshot_ok
+        else None
+    )
+
+    def _empty_result(
+        *,
+        invalid_reason: str = "",
+        remaining_override: Optional[Dict[int, int]] = None,
+    ) -> CausalBoardUpdate:
         return CausalBoardUpdate(
             grid=prev.copy(),
             removed=0,
-            expected_by_color={},
+            expected_by_color=dict(sorted(expected.items())),
             confirmed_by_color={},
-            remaining_by_color={},
+            remaining_by_color=(
+                dict(sorted(remaining_override.items()))
+                if remaining_override is not None
+                else {}
+            ),
             excess_by_color={},
-            invalid_reason="",
+            invalid_reason=invalid_reason,
             checked_cells=0,
+            temporal_confirmed_by_color={},
+            background_confirmed_by_color={},
+            ambiguous_changed_by_color={},
+            temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
+            temporal_snapshot_available=bool(snapshot_ok),
         )
+
+    if not expected:
+        return _empty_result()
 
     grid = prev.copy()
     background_rgb = _estimate_background_rgb(prev, image_rgb)
 
+    # 没有 temporal snapshot 时仍可退回纯背景证据，兼容旧 solver_state；
+    # 新局 --reset 后会自动持久化 snapshot。
     remaining = dict(expected)
     confirmed: Dict[int, int] = defaultdict(int)
+    temporal_confirmed: Dict[int, int] = defaultdict(int)
+    background_confirmed: Dict[int, int] = defaultdict(int)
+    ambiguous_changed: Dict[int, int] = defaultdict(int)
     excess: Dict[int, int] = defaultdict(int)
     checked_cells = 0
 
-    # 对同一稳定截图中已经判断为“仍存在/无法确认”的格子不重复采样；
-    # 当其邻接关系因其它格子被清空而改变时，它本身像素并不会改变，
-    # 因此再次采样没有价值。
-    settled: Set[Tuple[int, int]] = set()
+    # 一张稳定截图中，每个格子的视觉证据固定；同一轮不用重复采样。
+    checked: Set[Tuple[int, int]] = set()
 
-    for _round in range(GRID_ROWS * GRID_COLS + 1):
-        frontier = _frontier_cells(grid)
-        pending = [
-            pos
-            for pos in sorted(frontier)
-            if pos not in settled
-        ]
-        if not pending:
+    max_rounds = GRID_ROWS * GRID_COLS + 1
+    for _round in range(max_rounds):
+        comps, _opened = reachable_components(grid)
+
+        candidate_positions_by_color: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for color, budget in sorted(remaining.items()):
+            if budget <= 0:
+                continue
+            for group in comps.get(color, []):
+                for pos in group:
+                    if pos not in checked:
+                        candidate_positions_by_color[color].append(pos)
+
+        if not any(candidate_positions_by_color.values()):
             break
 
         newly_removed = 0
 
-        # 先收集这一层“明确已经是背景”的候选，再按颜色预算提交。
-        empty_candidates_by_color: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-
-        for r, c in pending:
-            old = int(grid[r, c])
-            if old <= 0:
-                settled.add((r, c))
-                continue
-
-            # 本轮该颜色没有任何实际吸收预算，则不需要读取这个格子：
-            # 它在物理上不可能因为本轮动作而消失。
-            if old not in expected:
-                settled.add((r, c))
-                continue
-
-            cx, cy = _grid_cell_center(
-                r,
-                c,
-                image_rgb.shape[1],
-                image_rgb.shape[0],
-            )
-            if ui_covered(
-                cx,
-                cy,
-                image_rgb.shape[1],
-                image_rgb.shape[0],
-            ):
-                settled.add((r, c))
-                continue
-
-            rgb = _sample_grid_cell(image_rgb, r, c)
-            checked_cells += 1
-
-            # 明确仍是原颜色 -> 保留。
-            if old - 1 < len(palette):
-                ref = palette[old - 1]
-                if float(np.linalg.norm(rgb - ref)) < KEEP_COLOR_DIST:
-                    settled.add((r, c))
-                    continue
-
-            # 只有明确看到棋盘背景才把它列入“本层真实空格”。
-            if _looks_like_empty_background(rgb, background_rgb, palette):
-                empty_candidates_by_color[old].append((r, c))
-                continue
-
-            # 既不像旧颜色又不像背景：通知/动画/高光/其它 UI。
-            # 不允许因此修改持久化状态。
-            settled.add((r, c))
-
-        for color, positions in sorted(empty_candidates_by_color.items()):
+        for color, positions in sorted(candidate_positions_by_color.items()):
             budget = int(remaining.get(color, 0))
             if budget <= 0:
-                # 数学上该颜色本轮已经没有剩余吸收量，
-                # 但又在新的拓扑 frontier 发现明确背景，属于硬矛盾。
-                excess[color] += len(positions)
-                settled.update(positions)
                 continue
 
-            if len(positions) > budget:
-                # 视觉在同一层看到了比容量守恒允许值更多的“空格”。
-                #
-                # 旧版会任意挑 budget 个提交，这虽然数量守恒，却不能证明
-                # 具体是哪几个位置真实属于本轮消失，可能把颜色误分类继续写进状态。
-                #
-                # v5.6：该颜色这一层一个都不猜；整组隔离为不可信，预算保留给
-                # 下一张稳定截图/后续重同步。其它颜色仍可正常提交。
-                excess[color] += len(positions) - budget
-                settled.update(positions)
+            # evidence tuple:
+            # (rank, change_dist, is_background, (r,c))
+            #
+            # rank:
+            #   3 = 明确灰背景
+            #   2 = strong temporal change
+            #   1 = normal temporal change
+            evidences: List[Tuple[int, float, bool, Tuple[int, int]]] = []
+
+            for r, c in sorted(set(positions)):
+                checked.add((r, c))
+
+                cx, cy = _grid_cell_center(
+                    r,
+                    c,
+                    image_rgb.shape[1],
+                    image_rgb.shape[0],
+                )
+                if ui_covered(
+                    cx,
+                    cy,
+                    image_rgb.shape[1],
+                    image_rgb.shape[0],
+                ):
+                    continue
+
+                current_rgb = current_grid_rgb[r, c]
+                checked_cells += 1
+
+                is_background = _looks_like_empty_background(
+                    current_rgb,
+                    background_rgb,
+                    palette,
+                )
+
+                change_dist = 0.0
+                if previous_rgb is not None:
+                    change_dist = float(
+                        np.linalg.norm(current_rgb - previous_rgb[r, c])
+                    )
+
+                if is_background:
+                    evidences.append((3, change_dist, True, (r, c)))
+                    continue
+
+                if previous_rgb is not None:
+                    if change_dist >= _CAUSAL_TEMPORAL_STRONG_CHANGE_DIST:
+                        evidences.append((2, change_dist, False, (r, c)))
+                        continue
+                    if change_dist >= _CAUSAL_TEMPORAL_CHANGE_DIST:
+                        evidences.append((1, change_dist, False, (r, c)))
+                        continue
+
+                # 没有明确 temporal/background 变化：保持旧状态。
+                # 注意：这里不再用“仍接近 palette”作为提前否定条件。
+                # 底部 sprite 脚/阴影可能导致逻辑格已被吸收却仍接近原色。
+
+            if not evidences:
                 continue
 
-            for r, c in positions:
+            # 优先：背景 > 强时间变化 > 一般时间变化；同级按变化距离降序。
+            evidences.sort(
+                key=lambda item: (item[0], item[1]),
+                reverse=True,
+            )
+
+            if len(evidences) > budget:
+                # 容量数学仍是最终数量约束。多出的视觉变化只记 telemetry，
+                # 不把它当 incomplete/hard conflict；选择证据最强的 budget 个。
+                ambiguous_changed[color] += len(evidences) - budget
+
+            selected = evidences[:budget]
+
+            for rank, _change_dist, is_background, (r, c) in selected:
+                if int(grid[r, c]) != color:
+                    continue
+
                 grid[r, c] = EMPTY
                 confirmed[color] += 1
                 remaining[color] -= 1
                 newly_removed += 1
 
-        # 所有预算已经落实，不必继续扫描。
+                if is_background:
+                    background_confirmed[color] += 1
+                elif rank >= 1:
+                    temporal_confirmed[color] += 1
+
         if all(v <= 0 for v in remaining.values()):
             break
 
-        # 没有新 EMPTY，拓扑无法继续推进；剩余预算留给 incomplete 报告。
+        # 已删除位置可能暴露新的异色/同色 component。
         if newly_removed == 0:
             break
 
@@ -581,15 +669,13 @@ def update_grid_causal(
         for color, count in sorted(remaining.items())
         if count > 0
     }
-    excess_nonzero = {
-        color: count
-        for color, count in sorted(excess.items())
-        if count > 0
-    }
 
     invalid_reason = ""
-    if background_rgb is None:
-        invalid_reason = "无法可靠估计棋盘 EMPTY 背景色"
+    if not snapshot_ok and background_rgb is None:
+        invalid_reason = (
+            "既没有上一 committed stable RGB snapshot，"
+            "也无法可靠估计棋盘 EMPTY 背景色"
+        )
 
     return CausalBoardUpdate(
         grid=grid,
@@ -597,12 +683,15 @@ def update_grid_causal(
         expected_by_color=dict(sorted(expected.items())),
         confirmed_by_color=dict(sorted(confirmed.items())),
         remaining_by_color=remaining_nonzero,
-        excess_by_color=excess_nonzero,
+        excess_by_color=dict(sorted(excess.items())),
         invalid_reason=invalid_reason,
         checked_cells=checked_cells,
+        temporal_confirmed_by_color=dict(sorted(temporal_confirmed.items())),
+        background_confirmed_by_color=dict(sorted(background_confirmed.items())),
+        ambiguous_changed_by_color=dict(sorted(ambiguous_changed.items())),
+        temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
+        temporal_snapshot_available=bool(snapshot_ok),
     )
-
-
 
 def update_grid(
     prev: np.ndarray,

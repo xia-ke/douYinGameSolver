@@ -498,8 +498,9 @@ def evaluate_candidates(
     # 因此直接模拟联合动作 [A, B]，不再先生成 A 的“串行 post-state”。
     if include_queue_lookahead:
         for candidate in candidates:
-            if candidate.rejected:
-                continue
+            # v5.8 experiment mode:
+            # candidate.rejected 只表示“模型预测存在稳定占用风险”，
+            # 不再作为阻止继续实验/传播第二排价值的硬门槛。
 
             first_car = front_by_col.get(candidate.column)
             next_car = next_by_col.get(candidate.column)
@@ -525,9 +526,6 @@ def evaluate_candidates(
                 [first_car, promoted],
                 slots,
             )
-            if not pair_sim.stable_safe:
-                continue
-
             pair_score = _score_flow(
                 pair_sim,
                 occupied_slots=occupied_slots,
@@ -620,7 +618,9 @@ def choose_two_step_plan(
     if free_slots < 2:
         return None
 
-    valid_first = [c for c in candidates if not c.rejected]
+    # v5.8 experiment mode:
+    # rejected 仅用于日志风险标记，不再从可实验动作中删除。
+    valid_first = list(candidates)
     if not valid_first:
         return None
 
@@ -652,9 +652,6 @@ def choose_two_step_plan(
             action_cars,
             slots,
         )
-        if not pair_sim.stable_safe:
-            return
-
         pair_score = _score_flow(
             pair_sim,
             occupied_slots=occupied_slots,
@@ -885,7 +882,7 @@ def format_report(
                 f"（{'确定' if c.next_vehicle_exact else '保守'}闭包）"
             )
         if c.rejected:
-            flags.append("稳定状态硬禁止")
+            flags.append("模型风险警告（不阻止实验）")
         if c.next_color is not None:
             if c.next_capacity is not None:
                 flags.append(f"第二排 {ctag(c.next_color)}×{c.next_capacity}")
@@ -955,7 +952,13 @@ def format_report(
 
 
 def best_valid_candidate(candidates: Sequence[Candidate]) -> Optional[Candidate]:
-    valid = [candidate for candidate in candidates if not candidate.rejected]
-    if not valid:
+    """
+    v5.8 experiment mode:
+    始终返回当前评分最高的可识别候选。
+
+    Candidate.rejected 现在只保留为日志/模型风险标记，不再形成硬 veto。
+    这样可以持续获得真实运行数据，再通过 decision_log 对预测偏差做迭代修正。
+    """
+    if not candidates:
         return None
-    return max(valid, key=lambda c: c.score)
+    return max(candidates, key=lambda c: c.score)

@@ -15,7 +15,7 @@ from .adb import (
 )
 from .board import (
     CausalBoardUpdate, ctag, initial_grid, learn_palette,
-    reachable_summary, update_grid, update_grid_causal,
+    reachable_summary, sample_grid_rgb_snapshot, update_grid, update_grid_causal,
 )
 from .config import FRONT_Y_N, UNKNOWN
 from .display import ClickMark, SolverDisplay
@@ -28,7 +28,7 @@ from .game_ocr import (
 )
 install_game_digit_ocr(_ocr)
 from .ocr import read_number_at
-from .state import load_state, save_state
+from .state import load_state_with_grid_rgb, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
     format_report, format_two_step_plan,
@@ -47,7 +47,7 @@ from .vehicles import (
 # v5.6 运行时安全状态机
 # ---------------------------------------------------------------------------
 # 目标不是“发现一次异常就退出 Python”，而是：
-#   NORMAL -> RETRY_OBSERVATION -> DEGRADED -> PAUSED_SAFE -> HARD_STOP
+#   NORMAL -> RETRY_OBSERVATION -> PAUSED_SYNC / DEGRADED -> PAUSED_SAFE -> HARD_STOP
 #
 # 常态下尽量自动运行；局部模型不可信时隔离对应颜色、关闭多步和停车连锁
 # guarantee；只有持续且无法恢复的高风险状态才真正退出。
@@ -88,13 +88,14 @@ class _SafetyRuntime:
         self.pause_reason = reason
         self.clean_streak = 0
 
-    def note_board_incomplete(self, colors) -> None:
+    def pause_sync(self, reason: str) -> None:
+        # 当前动作的棋盘转移尚未完整落盘。此状态严禁产生新点击，
+        # 也不把 unresolved consumption 跨动作累计。
+        self.mode = "PAUSED_SYNC"
+        self.pause_reason = reason
+        self.clean_streak = 0
         self.board_incomplete_streak += 1
-        self.degrade(
-            colors=colors,
-            reason="因果棋盘预算未完全落实",
-            turns=3,
-        )
+
 
     def note_model_conflict(self, colors) -> None:
         self.degrade(
@@ -124,6 +125,15 @@ class _SafetyRuntime:
         self.clean_streak += 1
         if self.conservative_turns > 0:
             self.conservative_turns -= 1
+
+        if self.mode == "PAUSED_SYNC":
+            # 当前转移终于完整同步。先以单步/自完成门槛运行一小段，
+            # 避免刚恢复时立刻重新使用激进多步。
+            self.mode = "DEGRADED"
+            self.conservative_turns = max(self.conservative_turns, 2)
+            self.pause_reason = "棋盘转移已重新同步，暂以保守模式恢复"
+            self.clean_streak = 0
+            return
 
         if self.mode == "PAUSED_SAFE":
             # PAUSED_SAFE 不自动跳回 NORMAL。连续两张稳定、无冲突截图后，
@@ -403,8 +413,37 @@ def _format_causal_board_update(
         "因果棋盘更新:",
         f"  数学确定实际吸收: {expected}",
         f"  拓扑+截图已落实为空: {confirmed}",
-        f"  本轮仅检查 frontier 格子 {update.checked_cells} 个",
+        f"  本轮检查 reachable 同色连通块候选 {update.checked_cells} 个格子",
+        (
+            "  temporal snapshot: "
+            + ("可用" if update.temporal_snapshot_available else "不可用（退回背景判定）")
+            + f"，变化阈值={update.temporal_change_threshold:.1f}"
+        ),
     ]
+
+    if update.background_confirmed_by_color:
+        bg = ", ".join(
+            f"{ctag(color)}={count}"
+            for color, count in update.background_confirmed_by_color.items()
+        )
+        lines.append(f"  灰背景直接确认: {bg}")
+
+    if update.temporal_confirmed_by_color:
+        temporal = ", ".join(
+            f"{ctag(color)}={count}"
+            for color, count in update.temporal_confirmed_by_color.items()
+        )
+        lines.append(f"  时间差分确认: {temporal}")
+
+    if update.ambiguous_changed_by_color:
+        ambiguous = ", ".join(
+            f"{ctag(color)}多{count}"
+            for color, count in update.ambiguous_changed_by_color.items()
+        )
+        lines.append(
+            "  额外变化候选（仅telemetry，容量数学已裁剪）: "
+            + ambiguous
+        )
 
     if update.remaining_by_color:
         missing = ", ".join(
@@ -433,17 +472,17 @@ def analyze_image(
     slots: int,
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None,
     flow_capacity_before_by_color: Optional[Dict[int, int]] = None,
-    carry_consumed_by_color: Optional[Dict[int, int]] = None,
     strategy_untrusted_colors: Optional[Set[int]] = None,
     force_single_step: bool = False,
     disable_parked_chain: bool = False,
     previous_prediction_upper: Optional[int] = None,
     previous_prediction_basis: str = "",
+    commit_state: bool = True,
 ) -> AnalysisResult:
     """
     分析一张已经稳定的游戏截图。
 
-    v5.6 关键变化：
+    v5.7 关键变化：
       - 因果棋盘异常只返回结构化状态，不在这里直接“杀进程”；
       - MODEL_INCONSISTENT 只隔离冲突颜色；
       - GUARANTEE_BROKEN 当前轮直接切换保守策略；
@@ -458,6 +497,7 @@ def analyze_image(
         image_bgr,
         cv2.COLOR_BGR2RGB,
     ).astype(np.float32)
+    current_grid_rgb = sample_grid_rgb_snapshot(image_rgb)
 
     front_centers = detect_front_centers(image_bgr)
 
@@ -515,9 +555,14 @@ def analyze_image(
         parking_empty_ref = parking_roi(image_bgr)
 
     else:
-        palette, prev_grid, turn, saved_size, parking_empty_ref = load_state(
-            state_path
-        )
+        (
+            palette,
+            prev_grid,
+            turn,
+            saved_size,
+            parking_empty_ref,
+            prev_grid_rgb,
+        ) = load_state_with_grid_rgb(state_path)
         if saved_size != (image_w, image_h):
             raise RuntimeError(
                 f"截图尺寸从 {saved_size[0]}x{saved_size[1]} 变成 "
@@ -547,31 +592,17 @@ def analyze_image(
         )
 
         expected_consumed: Dict[int, int] = {}
-        for color, count in (carry_consumed_by_color or {}).items():
-            color = int(color)
-            count = int(count)
-            if color > 0 and count > 0:
-                expected_consumed[color] = (
-                    expected_consumed.get(color, 0) + count
-                )
-
         if flow_capacity_before_by_color is not None:
-            delta_consumed, causal_input_invalid = (
+            expected_consumed, causal_input_invalid = (
                 _actual_consumed_from_capacity_delta(
                     flow_capacity_before_by_color,
                     parked,
                 )
             )
-            if not causal_input_invalid:
-                for color, count in delta_consumed.items():
-                    expected_consumed[color] = (
-                        expected_consumed.get(color, 0) + int(count)
-                    )
 
-        has_causal_context = bool(
-            flow_capacity_before_by_color is not None
-            or carry_consumed_by_color
-        )
+        # unresolved consumption 只属于“上一动作 -> 当前稳定截图”这一次转移。
+        # 若无法完整定位，调用方必须保持旧 state 并继续观察；绝不跨新动作 carry。
+        has_causal_context = flow_capacity_before_by_color is not None
 
         if causal_input_invalid:
             # 容量守恒本身失败：不能拿任何数量修改棋盘。
@@ -584,6 +615,7 @@ def analyze_image(
                 image_rgb,
                 palette,
                 expected_consumed,
+                prev_grid_rgb=prev_grid_rgb,
             )
             grid = causal_update.grid
             removed_since_last = causal_update.removed
@@ -620,7 +652,7 @@ def analyze_image(
         )
 
     stable_conflicts: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
-    if board_update_status != "causal_invalid":
+    if board_update_status == "ok":
         stable_conflicts = _stable_state_conflicts(grid, parked)
 
     guarantee_broken = bool(
@@ -628,23 +660,18 @@ def analyze_image(
         and occupied_slots > int(previous_prediction_upper)
     )
 
-    # ---------- 构造“策略可信视图” ----------
+    # ---------- v5.8 实验模式 ----------
     #
-    # 实际 grid 仍保留用于日志与后续重同步；
-    # 不可信颜色在 strategy_grid 中改成 UNKNOWN：
-    #   - 它们不能提供 reachable；
-    #   - 不能提供 chain opening；
-    #   - 对应停车车也无法凭这些色块获得 completion guarantee。
+    # 所有异常都保留为 telemetry，不再从 strategy_grid 中删除颜色、
+    # 不再把 Candidate.rejected 当作禁止点击条件。
+    #
+    # 原因：当前项目已经具备完整 decision_log，现阶段更需要持续收集
+    # “模型预测 vs 真实下一帧”的偏差，而不是在轻微矛盾处停止运行。
     untrusted: Set[int] = {
         int(c)
         for c in (strategy_untrusted_colors or set())
         if int(c) > 0
     }
-
-    if causal_update is not None and not causal_update.complete:
-        untrusted.update(causal_update.remaining_by_color)
-        untrusted.update(causal_update.excess_by_color)
-
     untrusted.update(stable_conflicts)
 
     if disable_parked_chain or guarantee_broken:
@@ -655,14 +682,14 @@ def analyze_image(
         )
 
     strategy_grid = grid.copy()
-    for color in untrusted:
-        strategy_grid[strategy_grid == int(color)] = UNKNOWN
 
+    # 异常状态下最多降为单步实验，避免一次叠加过多变量；
+    # 但绝不阻止游戏继续点击。
     local_force_single = bool(
         force_single_step
         or guarantee_broken
-        or board_update_status == "incomplete"
         or stable_conflicts
+        or board_update_status != "ok"
     )
 
     candidates = evaluate_candidates(
@@ -725,10 +752,10 @@ def analyze_image(
             | set(causal_update.excess_by_color)
         )
         report += (
-            "\n\n!!! BOARD_UPDATE_INCOMPLETE / RETRY→DEGRADED !!!\n"
+            "\n\n!!! BOARD_UPDATE_INCOMPLETE / EXPERIMENT_WARNING !!!\n"
             "容量守恒预算尚未完整落实到具体格子。"
-            "自动模式会先重新截图重试；若持续存在，则只提交已确认的部分状态，"
-            "保留未落实预算到下一轮，并把问题颜色隔离为 UNKNOWN。"
+            "实验模式会提交当前已确认的保守棋盘并继续单步运行；"
+            "未落实数量只写入日志，不跨动作 carry，也不阻止下一次点击。"
             f"\n问题颜色: "
             f"{', '.join(ctag(c) for c in problem_colors) or '未知'}"
         )
@@ -743,44 +770,41 @@ def analyze_image(
             in sorted(stable_conflicts.items())
         )
         report += (
-            "\n\n!!! MODEL_INCONSISTENT / DEGRADED !!!\n"
+            "\n\n!!! MODEL_INCONSISTENT / EXPERIMENT_WARNING !!!\n"
             f"矛盾项: {conflict_text}\n"
-            "不再终止整局：仅把冲突颜色从策略可信视图中隔离，"
-            "这些颜色不能提供 reachable、停车释放 guarantee 或开路奖励；"
-            "并关闭当前轮多步执行。"
+            "仅记录模型矛盾，不隔离颜色、不 veto 候选。"
+            "当前轮最多降为单步，继续收集下一稳定截图验证模型。"
         )
 
     if guarantee_broken:
         report += (
-            "\n\n!!! GUARANTEE_BROKEN / DEGRADED !!!\n"
+            "\n\n!!! GUARANTEE_BROKEN / EXPERIMENT_WARNING !!!\n"
             f"上一轮保证稳定停车占用 <= {previous_prediction_upper}，"
             f"当前稳定截图实际为 {occupied_slots}/{slots}。\n"
             f"上一轮依据: {previous_prediction_basis or '未记录'}\n"
-            "当前轮立即关闭多步和停车连锁 guarantee，"
-            "由运行时安全状态机决定是否进入 PAUSED_SAFE。"
+            "该结果只作为模型校准证据写入日志；当前轮继续运行，"
+            "最多降为单步实验。"
         )
 
     if untrusted:
         report += (
-            "\n\n保守策略隔离颜色: "
+            "\n\n模型不可信颜色（仅日志标记，不阻止点击）: "
             + ", ".join(ctag(c) for c in sorted(untrusted))
         )
 
-    if board_update_status == "causal_invalid":
-        best = None
-        two_step_plan = None
-    elif two_step_plan is not None:
+    if two_step_plan is not None:
         report += "\n\n" + format_two_step_plan(two_step_plan)
         best = two_step_plan.first
     else:
         best = best_valid_candidate(candidates)
 
-    # 完整因果更新才由 analyze_image 正常提交。
-    # incomplete 的“部分提交 + carry budget”由自动运行层在重试耗尽后显式完成。
-    state_saved = board_update_status == "ok"
-
-    if state_saved:
-        turn += 1
+    # v5.9：
+    # analyze_image 在观测重试期间必须是“只读 committed state”的纯分析。
+    # 所有 retry 都从同一个 solver_state 重新计算，只有调用方最终选定一次
+    # observation 后才 commit。单图模式仍使用默认 commit_state=True。
+    turn += 1
+    state_saved = bool(commit_state)
+    if commit_state:
         save_state(
             state_path,
             palette,
@@ -789,9 +813,8 @@ def analyze_image(
             image_w,
             image_h,
             parking_empty_ref,
+            grid_rgb_snapshot=current_grid_rgb,
         )
-    else:
-        turn += 1
 
     remaining_by_color = (
         dict(causal_update.remaining_by_color)
@@ -830,6 +853,7 @@ def analyze_image(
         guarantee_broken=guarantee_broken,
         guarantee_expected_upper=previous_prediction_upper,
         state_saved=state_saved,
+        grid_rgb_snapshot=current_grid_rgb,
     )
 
 def queue_empty_on_image(
@@ -1101,15 +1125,15 @@ def _retriable_analysis_error(exc: RuntimeError) -> bool:
     )
 
 
-def _commit_partial_analysis_state(
+
+def _commit_analysis_result_state(
     state_path: Path,
     result: AnalysisResult,
 ) -> None:
     """
-    BOARD_UPDATE_INCOMPLETE 重试耗尽后提交“已确认的保守部分”。
-
-    未落实的数量不会丢失，而由 runtime 的 carry_consumed_by_color
-    带到下一张稳定截图继续落实。
+    v5.9 retry-safe commit：
+    一轮多个 observation 全部只读同一个 committed solver_state；
+    最终只把选中的一次结果写盘。
     """
     save_state(
         state_path,
@@ -1119,20 +1143,32 @@ def _commit_partial_analysis_state(
         result.image_w,
         result.image_h,
         result.parking_empty_ref,
+        grid_rgb_snapshot=result.grid_rgb_snapshot,
     )
     result.state_saved = True
 
 
-def _merge_positive_counts(*parts: Optional[Dict[int, int]]) -> Dict[int, int]:
-    out: Dict[int, int] = {}
-    for part in parts:
-        for color, count in (part or {}).items():
-            color = int(color)
-            count = int(count)
-            if color <= 0 or count <= 0:
-                continue
-            out[color] = out.get(color, 0) + count
-    return out
+def _observation_quality(result: AnalysisResult) -> Tuple[int, int, int]:
+    """
+    越小越好。用于多次稳定观测中选择最完整的一次，而不是机械使用最后一次。
+
+    0: 完整同步
+    1: incomplete，按剩余预算总量排序
+    2: causal_invalid
+    """
+    if result.board_update_status == "ok":
+        return (0, 0, -int(result.grid.size))
+    if result.board_update_status == "incomplete":
+        remaining = sum(
+            max(0, int(v))
+            for v in result.board_update_remaining_by_color.values()
+        )
+        excess = sum(
+            max(0, int(v))
+            for v in result.board_update_excess_by_color.values()
+        )
+        return (1, remaining + excess, -int(np.count_nonzero(result.grid == 0)))
+    return (2, 10**9, 0)
 
 def run_auto_flow_mode(args: argparse.Namespace) -> int:
     display = SolverDisplay(
@@ -1157,7 +1193,6 @@ def _run_auto_flow_mode_impl(
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
     pending_prediction: Optional[Tuple[int, str, str]] = None
     pending_flow_capacity_before_by_color: Optional[Dict[int, int]] = None
-    pending_carry_consumed_by_color: Optional[Dict[int, int]] = None
     safety = _SafetyRuntime()
     log_path = _resolve_decision_log_path(args)
     _append_session_marker(log_path, reset=args.reset)
@@ -1187,8 +1222,8 @@ def _run_auto_flow_mode_impl(
         "稳定后停车占用最坏上界必须 < 总停车位。"
     )
     print(
-        "安全状态机: NORMAL → RETRY_OBSERVATION → DEGRADED → "
-        "PAUSED_SAFE；只有持续不可恢复的高风险状态才退出。"
+        "实验模式: observation retry 只读同一 committed state；"
+        "最终只提交一次最完整观测，异常继续写日志而不形成策略 veto。"
     )
 
     while True:
@@ -1208,13 +1243,16 @@ def _run_auto_flow_mode_impl(
         )
 
         flow_context = pending_flow_capacity_before_by_color
-        carry_context = pending_carry_consumed_by_color
         prediction_context = pending_prediction
 
         result: Optional[AnalysisResult] = None
         analysis_bgr: Optional[np.ndarray] = None
         shot: Optional[Path] = None
         last_retry_error = ""
+
+        best_observation_result: Optional[AnalysisResult] = None
+        best_observation_shot: Optional[Path] = None
+        best_observation_bgr: Optional[np.ndarray] = None
 
         for observation_attempt in range(1, max_observation_attempts + 1):
             if observation_attempt == 1:
@@ -1262,7 +1300,6 @@ def _run_auto_flow_mode_impl(
                     slots=args.slots,
                     front_number_cache=front_number_cache,
                     flow_capacity_before_by_color=flow_context,
-                    carry_consumed_by_color=carry_context,
                     strategy_untrusted_colors=safety.untrusted_colors,
                     force_single_step=safety.force_single_step,
                     disable_parked_chain=safety.disable_parked_chain,
@@ -1276,6 +1313,9 @@ def _run_auto_flow_mode_impl(
                         if prediction_context is not None
                         else ""
                     ),
+                    # v5.9：retry 期间禁止写 solver_state。
+                    # 所有 attempt 必须从同一个 committed state 重算。
+                    commit_state=False,
                 )
             except RuntimeError as exc:
                 if not _retriable_analysis_error(exc):
@@ -1302,6 +1342,16 @@ def _run_auto_flow_mode_impl(
                 result = None
                 break
 
+            # 记录当前轮最完整的一次观测。即使后续 retry 更差，也不会覆盖它。
+            if (
+                best_observation_result is None
+                or _observation_quality(result)
+                < _observation_quality(best_observation_result)
+            ):
+                best_observation_result = result
+                best_observation_shot = shot
+                best_observation_bgr = analysis_bgr
+
             # 容量守恒无效或棋盘预算没有落实完整：先重新截图，不立即降级/退出。
             if (
                 result.board_update_status in ("incomplete", "causal_invalid")
@@ -1324,6 +1374,13 @@ def _run_auto_flow_mode_impl(
                 continue
 
             break
+
+        # 如果至少有一次成功分析，使用本轮质量最好的 observation。
+        # 这同时防止“第一次 39/55，后续 retry 反而 0/55”之类的退化覆盖。
+        if best_observation_result is not None:
+            result = best_observation_result
+            shot = best_observation_shot
+            analysis_bgr = best_observation_bgr
 
         reset_current = False
 
@@ -1351,86 +1408,46 @@ def _run_auto_flow_mode_impl(
             continue
 
         assert shot is not None
+
+        # v5.9 retry-safe commit：
+        # 现在才把本轮最终选定的 candidate grid + 当前 stable RGB snapshot
+        # 写入 solver_state。turn 也只因此前进一次。
+        _commit_analysis_result_state(args.state, result)
+
         front_number_cache = result.front_number_cache
 
-        # ----- 处理因果棋盘状态 -----
-        if result.board_update_status == "causal_invalid":
-            # 无法建立容量守恒时不能消耗上一轮上下文；保持它，下一张图继续重试。
-            safety.pause(
-                "容量守恒输入持续无效，等待新的稳定观测"
-            )
+        # ----- v5.8 实验模式：异常只记录，不阻止游戏继续 -----
+        sync_pending = result.board_update_status in (
+            "incomplete",
+            "causal_invalid",
+        )
+
+        if sync_pending:
             result.report += (
-                "\n\n[SAFETY_STATE] "
-                + safety.status_line()
-                + "\n本轮不点击；保留上一轮容量上下文继续观测。"
+                "\n\n[EXPERIMENT_WARNING]\n"
+                "本轮棋盘因果同步不完整，但实验模式不会暂停。"
+                "已提交当前保守 grid；旧 checkpoint 在这里结束，"
+                "未落实数量不跨动作 carry。"
             )
 
-        elif result.board_update_status == "incomplete":
-            # 重试耗尽：提交已经确定的部分 EMPTY，剩余数学预算继续携带。
-            problem_colors = (
-                set(result.board_update_remaining_by_color)
-                | set(result.board_update_excess_by_color)
-            )
-            safety.note_board_incomplete(problem_colors)
+        # 无论本轮是否完整，都结束上一动作 checkpoint，
+        # 避免历史 unresolved consumption 污染新动作。
+        pending_flow_capacity_before_by_color = None
+        pending_prediction = None
 
-            _commit_partial_analysis_state(
-                args.state,
-                result,
-            )
-
-            pending_carry_consumed_by_color = dict(
-                result.board_update_remaining_by_color
-            )
-            pending_flow_capacity_before_by_color = None
-
-            result.report += (
-                "\n\n[DEGRADED COMMIT]\n"
-                "观测重试耗尽，已提交本轮明确确认的部分棋盘状态；"
-                "未落实 consumption budget 不会丢失，将带到下一轮继续定位。\n"
-                f"carry={pending_carry_consumed_by_color or {}}\n"
-                + safety.status_line()
-            )
-
-        else:
-            # 完整消费了上一轮容量上下文和历史 carry。
-            pending_flow_capacity_before_by_color = None
-            pending_carry_consumed_by_color = None
-
-        # 当前稳定截图足够可信时，上一轮 prediction checkpoint 使用一次即结束。
-        if result.board_update_status != "causal_invalid":
-            pending_prediction = None
-
-        # ----- 更新安全状态机 -----
-        had_issue = False
-
+        # SafetyRuntime 现在只保留 telemetry/单步降级信息，不再拥有 veto 权。
         if result.guarantee_broken:
             safety.note_guarantee_broken(round_no)
-            had_issue = True
-
         if result.model_conflict_colors:
-            safety.note_model_conflict(
-                result.model_conflict_colors
-            )
-            had_issue = True
-
-        if result.board_update_status == "incomplete":
-            had_issue = True
-
-        if result.board_update_status == "causal_invalid":
-            had_issue = True
-
-        if not had_issue:
+            safety.note_model_conflict(result.model_conflict_colors)
+        if not result.guarantee_broken and not result.model_conflict_colors:
             safety.note_clean()
 
         result.report += (
-            "\n\n[SAFETY_STATE]\n"
+            "\n\n[EXPERIMENT_STATE]\n"
             + safety.status_line()
+            + "\n上述状态仅影响诊断和必要时的单步/多步选择，不阻止点击。"
         )
-
-        # 第二次 guarantee break / 长期高风险时不退出进程，只停止点击。
-        if safety.mode == "PAUSED_SAFE":
-            result.best = None
-            result.two_step_plan = None
 
         print(result.report)
         print(
@@ -1445,6 +1462,31 @@ def _run_auto_flow_mode_impl(
             result=result,
             step_label=step_label,
         )
+
+        if result.board_update_status in ("incomplete", "causal_invalid"):
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "EXPERIMENT_WARNING board-sync-incomplete; "
+                    "continue-with-conservative-grid; "
+                    + safety.status_line()
+                ),
+            )
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="实验模式 · 棋盘同步警告",
+                    hint=(
+                        "上一动作棋盘变化未完全解释；当前保守状态已写日志，"
+                        "继续执行评分最高的单步候选。"
+                    ),
+                )
+            print(
+                "EXPERIMENT_WARNING：棋盘同步未完全解释，"
+                "但不中断运行；继续使用当前保守 grid 做下一步实验。"
+            )
 
         if len(result.front) == 0 and len(result.nxt) == 0:
             if analysis_bgr is not None:
@@ -1533,46 +1575,22 @@ def _run_auto_flow_mode_impl(
             return 2
 
         if result.best is None:
-            if safety.mode != "PAUSED_SAFE":
-                safety.pause("当前没有确定安全候选动作")
-
-            # 本轮没有点击时，下一张稳定截图的“真实新增吸收量”应为0。
-            # 用当前停车剩余建立一个 zero-action 容量 checkpoint，
-            # 避免下一轮退回纯视觉 update_grid()。
-            #
-            # CAUSAL_CAPACITY_INVALID 例外：必须保留原 checkpoint 继续重试，
-            # 不能用当前不可信停车OCR覆盖它。
-            if result.board_update_status != "causal_invalid":
-                pending_flow_capacity_before_by_color = (
-                    _parking_remaining_by_color(result.parked)
-                )
-
+            # 只有“当前第一排根本没有形成任何可评分候选”才会到这里，
+            # 通常意味着 OCR/车辆识别本身没有足够信息，而不是策略 veto。
             _append_execution_update(
                 log_path,
                 screenshot=shot,
                 step_label=step_label,
-                execution=(
-                    "PAUSED_SAFE no-click; "
-                    + safety.status_line()
-                ),
+                execution="NO_CANDIDATE perception-only retry; no strategy veto",
             )
-            if analysis_bgr is not None:
-                display.show(
-                    analysis_bgr,
-                    stage="PAUSED_SAFE",
-                    hint=(
-                        "当前不执行点击；程序保持运行并继续重新截图。"
-                        "若后续观测恢复，将先回到 DEGRADED 再继续。"
-                    ),
-                )
             print(
-                "PAUSED_SAFE：当前没有足够可信的安全动作；"
-                "不退出程序，稍后重新分析。"
+                "当前没有形成可评分候选（通常是车辆/OCR识别不足）；"
+                "不退出程序，立即重新截图。"
             )
             time.sleep(
                 max(
-                    0.2,
-                    float(getattr(args, "safe_pause_retry_delay", 1.0)),
+                    0.15,
+                    float(getattr(args, "observation_retry_delay", 0.45)),
                 )
             )
             continue

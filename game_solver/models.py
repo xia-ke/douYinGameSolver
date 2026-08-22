@@ -104,3 +104,7 @@ class AnalysisResult:
     guarantee_broken: bool = False
     guarantee_expected_upper: Optional[int] = None
     state_saved: bool = True
+
+    # v5.9：当前稳定截图的 52x38x3 格子 RGB 快照。
+    # 自动重试结束后只在最终 commit 时写入 solver_state。
+    grid_rgb_snapshot: Optional[np.ndarray] = None
