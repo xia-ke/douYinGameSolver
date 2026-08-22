@@ -435,6 +435,18 @@ def _format_causal_board_update(
         )
         lines.append(f"  时间差分确认: {temporal}")
 
+    lines.append(
+        "  local patch previous frame: "
+        + ("可用" if update.patch_previous_frame_available else "不可用")
+        + f"，主体覆盖下降阈值={update.patch_coverage_drop_threshold:.2f}"
+    )
+    if update.patch_confirmed_by_color:
+        patch = ", ".join(
+            f"{ctag(color)}={count}"
+            for color, count in update.patch_confirmed_by_color.items()
+        )
+        lines.append(f"  局部主体消失确认: {patch}")
+
     if update.ambiguous_changed_by_color:
         ambiguous = ", ".join(
             f"{ctag(color)}多{count}"
@@ -478,6 +490,7 @@ def analyze_image(
     previous_prediction_upper: Optional[int] = None,
     previous_prediction_basis: str = "",
     commit_state: bool = True,
+    prev_grid_image_rgb: Optional[np.ndarray] = None,
 ) -> AnalysisResult:
     """
     分析一张已经稳定的游戏截图。
@@ -601,7 +614,7 @@ def analyze_image(
             )
 
         # unresolved consumption 只属于“上一动作 -> 当前稳定截图”这一次转移。
-        # 若无法完整定位，调用方必须保持旧 state 并继续观察；绝不跨新动作 carry。
+        # 若无法完整定位，实验模式记录异常并提交保守 grid；未落实数量不跨动作 carry。
         has_causal_context = flow_capacity_before_by_color is not None
 
         if causal_input_invalid:
@@ -616,6 +629,7 @@ def analyze_image(
                 palette,
                 expected_consumed,
                 prev_grid_rgb=prev_grid_rgb,
+                prev_image_rgb=prev_grid_image_rgb,
             )
             grid = causal_update.grid
             removed_since_last = causal_update.removed
@@ -1193,6 +1207,7 @@ def _run_auto_flow_mode_impl(
     front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
     pending_prediction: Optional[Tuple[int, str, str]] = None
     pending_flow_capacity_before_by_color: Optional[Dict[int, int]] = None
+    committed_analysis_rgb: Optional[np.ndarray] = None
     safety = _SafetyRuntime()
     log_path = _resolve_decision_log_path(args)
     _append_session_marker(log_path, reset=args.reset)
@@ -1316,6 +1331,7 @@ def _run_auto_flow_mode_impl(
                     # v5.9：retry 期间禁止写 solver_state。
                     # 所有 attempt 必须从同一个 committed state 重算。
                     commit_state=False,
+                    prev_grid_image_rgb=committed_analysis_rgb,
                 )
             except RuntimeError as exc:
                 if not _retriable_analysis_error(exc):
@@ -1409,10 +1425,14 @@ def _run_auto_flow_mode_impl(
 
         assert shot is not None
 
-        # v5.9 retry-safe commit：
-        # 现在才把本轮最终选定的 candidate grid + 当前 stable RGB snapshot
-        # 写入 solver_state。turn 也只因此前进一次。
+        # v5.9.2 experiment mode: commit the best conservative
+        # observation and continue; incomplete sync is telemetry.
         _commit_analysis_result_state(args.state, result)
+        if analysis_bgr is not None:
+            committed_analysis_rgb = cv2.cvtColor(
+                analysis_bgr,
+                cv2.COLOR_BGR2RGB,
+            ).astype(np.float32)
 
         front_number_cache = result.front_number_cache
 

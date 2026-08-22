@@ -47,6 +47,16 @@ _INCREMENTAL_BG_SAMPLE_LIMIT = 256
 _CAUSAL_TEMPORAL_CHANGE_DIST = 18.0
 _CAUSAL_TEMPORAL_STRONG_CHANGE_DIST = 32.0
 
+# v5.9.2: local sprite-body coverage fallback.
+# The exact 2x2 center may remain painted by a neighboring sprite even
+# after this logical block is gone. Compare a small in-cell patch against
+# the previous committed analysis frame.
+_CAUSAL_PATCH_COLOR_DIST = 44.0
+_CAUSAL_PATCH_COVERAGE_DROP = 0.18
+_CAUSAL_PATCH_MIN_PREV_COVERAGE = 0.55
+_CAUSAL_PATCH_HALF_X_FRAC = 0.38
+_CAUSAL_PATCH_HALF_Y_FRAC = 0.38
+
 # 当已存在 EMPTY 很少时，使用棋盘下缘和停车区之间的灰色游戏背景估计背景色。
 # 这些比例针对整个截图而不是棋盘网格；只作为首轮/极少 EMPTY 时的兜底。
 _INCREMENTAL_BG_FALLBACK_X1_N = 0.22
@@ -90,6 +100,9 @@ class CausalBoardUpdate:
     ambiguous_changed_by_color: Dict[int, int]
     temporal_change_threshold: float
     temporal_snapshot_available: bool
+    patch_confirmed_by_color: Dict[int, int]
+    patch_coverage_drop_threshold: float
+    patch_previous_frame_available: bool
 
     @property
     def complete(self) -> bool:
@@ -164,6 +177,41 @@ def sample_grid_rgb_snapshot(image_rgb: np.ndarray) -> np.ndarray:
         for c in range(GRID_COLS):
             snap[r, c] = _sample_grid_cell(image_rgb, r, c)
     return snap
+
+
+def _sample_grid_cell_color_coverage(
+    image_rgb: np.ndarray,
+    r: int,
+    c: int,
+    color: int,
+    palette: np.ndarray,
+) -> float:
+    if color <= 0 or color > len(palette):
+        return -1.0
+
+    h, w = image_rgb.shape[:2]
+    x, y = _grid_cell_center(r, c, w, h)
+    _x0, dx, _y0, dy = scaled_grid_geometry(w, h)
+
+    rx = max(2, int(round(dx * _CAUSAL_PATCH_HALF_X_FRAC)))
+    ry = max(2, int(round(dy * _CAUSAL_PATCH_HALF_Y_FRAC)))
+    cx = int(round(x))
+    cy = int(round(y))
+
+    x1 = max(0, cx - rx)
+    x2 = min(w, cx + rx + 1)
+    y1 = max(0, cy - ry)
+    y2 = min(h, cy + ry + 1)
+    patch = image_rgb[y1:y2, x1:x2, :3]
+    if patch.size == 0:
+        return -1.0
+
+    target = palette[color - 1].astype(np.float32)
+    dist = np.linalg.norm(
+        patch.astype(np.float32) - target[None, None, :],
+        axis=2,
+    )
+    return float(np.mean(dist < _CAUSAL_PATCH_COLOR_DIST))
 
 
 def ui_covered(x: float, y: float, w: int, h: int) -> bool:
@@ -463,6 +511,7 @@ def update_grid_causal(
     palette: np.ndarray,
     consumed_by_color: Dict[int, int],
     prev_grid_rgb: Optional[np.ndarray] = None,
+    prev_image_rgb: Optional[np.ndarray] = None,
 ) -> CausalBoardUpdate:
     """
     使用“容量守恒 + committed stable frame 时间差分”更新棋盘。
@@ -503,6 +552,16 @@ def update_grid_causal(
         else None
     )
 
+    previous_frame_ok = (
+        prev_image_rgb is not None
+        and np.asarray(prev_image_rgb).shape == image_rgb.shape
+    )
+    previous_frame = (
+        np.asarray(prev_image_rgb, dtype=np.float32)
+        if previous_frame_ok
+        else None
+    )
+
     def _empty_result(
         *,
         invalid_reason: str = "",
@@ -526,6 +585,9 @@ def update_grid_causal(
             ambiguous_changed_by_color={},
             temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
             temporal_snapshot_available=bool(snapshot_ok),
+            patch_confirmed_by_color={},
+            patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
+            patch_previous_frame_available=bool(previous_frame_ok),
         )
 
     if not expected:
@@ -539,6 +601,7 @@ def update_grid_causal(
     remaining = dict(expected)
     confirmed: Dict[int, int] = defaultdict(int)
     temporal_confirmed: Dict[int, int] = defaultdict(int)
+    patch_confirmed: Dict[int, int] = defaultdict(int)
     background_confirmed: Dict[int, int] = defaultdict(int)
     ambiguous_changed: Dict[int, int] = defaultdict(int)
     excess: Dict[int, int] = defaultdict(int)
@@ -549,16 +612,23 @@ def update_grid_causal(
 
     max_rounds = GRID_ROWS * GRID_COLS + 1
     for _round in range(max_rounds):
-        comps, _opened = reachable_components(grid)
+        # v5.9.1 strict physical frontier:
+        # temporal diff can localize a disappearance, but it must not punch an
+        # arbitrary hole inside a reachable same-color component. Only cells
+        # touching the currently open EMPTY region are physically eligible.
+        # After confirmed removals, the next loop recomputes the frontier.
+        frontier = _frontier_cells(grid)
 
         candidate_positions_by_color: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-        for color, budget in sorted(remaining.items()):
-            if budget <= 0:
+        for r, c in sorted(frontier):
+            if (r, c) in checked:
                 continue
-            for group in comps.get(color, []):
-                for pos in group:
-                    if pos not in checked:
-                        candidate_positions_by_color[color].append(pos)
+            color = int(grid[r, c])
+            if color <= 0:
+                continue
+            if int(remaining.get(color, 0)) <= 0:
+                continue
+            candidate_positions_by_color[color].append((r, c))
 
         if not any(candidate_positions_by_color.values()):
             break
@@ -623,9 +693,23 @@ def update_grid_causal(
                         evidences.append((1, change_dist, False, (r, c)))
                         continue
 
-                # 没有明确 temporal/background 变化：保持旧状态。
-                # 注意：这里不再用“仍接近 palette”作为提前否定条件。
-                # 底部 sprite 脚/阴影可能导致逻辑格已被吸收却仍接近原色。
+                # v5.9.2 fallback: compare old-color body coverage in a
+                # small patch against the previous committed analysis frame.
+                if previous_frame is not None:
+                    prev_cov = _sample_grid_cell_color_coverage(
+                        previous_frame, r, c, color, palette
+                    )
+                    if prev_cov >= _CAUSAL_PATCH_MIN_PREV_COVERAGE:
+                        curr_cov = _sample_grid_cell_color_coverage(
+                            image_rgb, r, c, color, palette
+                        )
+                        coverage_drop = prev_cov - curr_cov
+                        if coverage_drop >= _CAUSAL_PATCH_COVERAGE_DROP:
+                            # rank 0: weaker than direct center temporal.
+                            evidences.append((0, coverage_drop, False, (r, c)))
+                            continue
+
+                # No background/center-temporal/patch-coverage evidence.
 
             if not evidences:
                 continue
@@ -637,8 +721,8 @@ def update_grid_causal(
             )
 
             if len(evidences) > budget:
-                # 容量数学仍是最终数量约束。多出的视觉变化只记 telemetry，
-                # 不把它当 incomplete/hard conflict；选择证据最强的 budget 个。
+                # Experiment mode: record ambiguity but do not stall.
+                # Candidates are already restricted to the frontier.
                 ambiguous_changed[color] += len(evidences) - budget
 
             selected = evidences[:budget]
@@ -656,6 +740,8 @@ def update_grid_causal(
                     background_confirmed[color] += 1
                 elif rank >= 1:
                     temporal_confirmed[color] += 1
+                else:
+                    patch_confirmed[color] += 1
 
         if all(v <= 0 for v in remaining.values()):
             break
@@ -691,6 +777,9 @@ def update_grid_causal(
         ambiguous_changed_by_color=dict(sorted(ambiguous_changed.items())),
         temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
         temporal_snapshot_available=bool(snapshot_ok),
+        patch_confirmed_by_color=dict(sorted(patch_confirmed.items())),
+        patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
+        patch_previous_frame_available=bool(previous_frame_ok),
     )
 
 def update_grid(
