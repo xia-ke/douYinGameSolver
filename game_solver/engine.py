@@ -447,6 +447,14 @@ def _format_causal_board_update(
         )
         lines.append(f"  局部主体消失确认: {patch}")
 
+    if update.strong_nonfrontier_confirmed_by_color:
+        strong = ", ".join(
+            f"{ctag(color)}={count}"
+            for color, count
+            in update.strong_nonfrontier_confirmed_by_color.items()
+        )
+        lines.append(f"  强视觉非frontier确认: {strong}")
+
     if update.ambiguous_changed_by_color:
         ambiguous = ", ".join(
             f"{ctag(color)}多{count}"
@@ -1512,9 +1520,10 @@ def _run_auto_flow_mode_impl(
             if analysis_bgr is not None:
                 display.show(
                     analysis_bgr,
-                    stage="胜利确认",
+                    stage="胜利确认（兜底）",
                     hint=(
-                        "排队区第一次检测为空；"
+                        "进入分析前排队区已经为空；"
+                        "这通常表示上一轮点击已经点完最后一辆车。"
                         f"等待 {args.queue_empty_confirm_delay:.1f}s 再确认一次。"
                     ),
                 )
@@ -1534,7 +1543,11 @@ def _run_auto_flow_mode_impl(
                 display.show(
                     confirm_bgr,
                     stage="本局完成",
-                    hint="排队区连续两次无车辆；判定本局结束。",
+                    hint=(
+                        "排队区连续两次无车辆；"
+                        "按最后一辆排队车已点击规则判定本局结束。"
+                        "停车区是否仍有车不参与胜利判定。"
+                    ),
                 )
                 print(
                     f"排队区连续两次无车辆，判定本局结束。确认截图: {confirm_path}"
@@ -1849,6 +1862,69 @@ def _run_auto_flow_mode_impl(
             step_label=step_label,
             execution=f"monitor_end={Path(monitor_end).name if monitor_end else monitor_end}",
         )
+
+        # v5.10 confirmed rule: last queued car clicked == game complete.
+        # Parking does not need to become empty.  Check after the click batch's
+        # flow has stabilized and require two consecutive empty queue reads.
+        queue_check_bgr = adb_capture_bgr(args.serial)
+        queue_empty1, _queue_added1 = queue_empty_on_image(
+            queue_check_bgr,
+            result.palette,
+        )
+
+        if queue_empty1:
+            if args.queue_empty_confirm_delay > 0:
+                time.sleep(args.queue_empty_confirm_delay)
+
+            queue_confirm_bgr = adb_capture_bgr(args.serial)
+            queue_empty2, _queue_added2 = queue_empty_on_image(
+                queue_confirm_bgr,
+                result.palette,
+            )
+            queue_confirm_path = (
+                args.shots_dir
+                / f"queue_after_click_confirm_{shot_stamp()}.png"
+            )
+            save_bgr(queue_confirm_path, queue_confirm_bgr)
+
+            if queue_empty2:
+                _append_execution_update(
+                    log_path,
+                    screenshot=shot,
+                    step_label=step_label,
+                    execution=(
+                        "game-complete last queued car clicked; "
+                        f"confirm={queue_confirm_path.name}; "
+                        f"parking_before_last_click={result.occupied_slots}/{args.slots}"
+                    ),
+                )
+                display.show(
+                    queue_confirm_bgr,
+                    stage="本局完成",
+                    hint=(
+                        "上一轮点击后排队区连续两次为空："
+                        "已点击完排队区最后一辆车。"
+                        "停车位仍有车不影响胜利判定。"
+                    ),
+                )
+                print(
+                    "排队区在上一轮点击后连续两次为空；"
+                    "确认已点击完最后一辆排队车，本局结束。"
+                    "停车状态不参与胜利判定。"
+                    f"确认截图: {queue_confirm_path}"
+                )
+                return 0
+
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "queue-after-click-empty-cancelled; "
+                    f"confirm={queue_confirm_path.name}; "
+                    "second check found queued vehicles"
+                ),
+            )
 
         pending_flow_capacity_before_by_color = (
             _capacity_before_flow_by_color(

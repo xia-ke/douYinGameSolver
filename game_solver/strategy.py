@@ -62,26 +62,38 @@ def _guaranteed_parked_completions_from_supply(
     supply: int,
 ) -> int:
     """
-    同色块可在“已有停车车 + 本次点击车”之间任意分配时，
-    计算至少能保证完成多少辆已有停车车。
+    已确认游戏规则：停车位同色车按较小剩余数字优先吸收。
 
-    为尽量不让停车车完成，先允许：
-      1) 所有新点击车吸满；
-      2) 每辆停车车只吸到 remain-1。
-    超过这部分的每一个块都会强迫至少一辆停车车完成。
+    但“已停车车 vs 本轮新点击同色车”的相对优先级仍未确认，因此对
+    停车释放做安全下界时，先允许所有新点击同色车尽可能吸收；只有
+    必然剩给停车位的供给，再按停车剩余数字从小到大确定完成数量。
     """
-    parked_rems = [max(1, int(x)) for x in parked_remainders]
-    new_rems = [max(1, int(x)) for x in new_remainders]
+    parked_rems = sorted(
+        max(1, int(x))
+        for x in parked_remainders
+    )
+    new_rems = [
+        max(1, int(x))
+        for x in new_remainders
+    ]
     if not parked_rems or supply <= 0:
         return 0
 
     total_capacity = sum(parked_rems) + sum(new_rems)
     moved = min(int(supply), total_capacity)
-    no_parked_completion_max = (
-        sum(new_rems)
-        + sum(max(0, remain - 1) for remain in parked_rems)
-    )
-    return max(0, moved - no_parked_completion_max)
+
+    parked_supply = max(0, moved - sum(new_rems))
+    if parked_supply <= 0:
+        return 0
+
+    completed = 0
+    for remain in parked_rems:
+        if parked_supply < remain:
+            break
+        parked_supply -= remain
+        completed += 1
+
+    return completed
 
 
 def _clear_reachable_color(grid: np.ndarray, color: int) -> Tuple[np.ndarray, int]:
@@ -130,7 +142,8 @@ def simulate_flow_closure(
 
     - 停车车与本次点击车辆同时参与吸收；
     - 只要还有同色车辆有容量，可达同色块就持续被吃；
-    - 同色分配顺序未知，因此车辆完成数按最坏分配保证；
+    - 已停车的同色车辆按“剩余数字较小优先”分流；
+    - 已停车车与本轮新点击同色车之间的相对优先级仍未知，因此跨两类车辆仍按最坏情况保证；
     - 若同色总剩余容量 >= 当前全部可达块，则该颜色可确定全部清空，
       从棋盘删除并继续计算下一层暴露；
     - 若容量不足以清空，则能确定这些容量一定被吃满，但具体删除位置未知，
@@ -226,16 +239,22 @@ def simulate_flow_closure(
         new_rems = action_by_color.get(color, [])
         all_rems = list(parked_rems) + list(new_rems)
 
-        completed = guaranteed_completions_from_supply(all_rems, supply)
-        if completed > 0:
-            guaranteed_by_color[color] = completed
-            guaranteed_total += completed
-
         parked_completed = _guaranteed_parked_completions_from_supply(
             parked_rems,
             new_rems,
             supply,
         )
+
+        # 停车位 smallest-remain-first 可能证明更多停车车必然完成；
+        # 这些完成当然也属于所有 active 车辆的总完成数。
+        completed = max(
+            guaranteed_completions_from_supply(all_rems, supply),
+            parked_completed,
+        )
+        if completed > 0:
+            guaranteed_by_color[color] = completed
+            guaranteed_total += completed
+
         if parked_completed > 0:
             parked_completed_by_color[color] = parked_completed
             parked_total += parked_completed

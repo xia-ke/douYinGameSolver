@@ -57,6 +57,12 @@ _CAUSAL_PATCH_MIN_PREV_COVERAGE = 0.55
 _CAUSAL_PATCH_HALF_X_FRAC = 0.38
 _CAUSAL_PATCH_HALF_Y_FRAC = 0.38
 
+# v5.10: strong non-frontier fallback for unresolved mathematical budget.
+_CAUSAL_GLOBAL_STRONG_PREV_COVERAGE = 0.75
+_CAUSAL_GLOBAL_STRONG_CURR_COVERAGE_MAX = 0.20
+_CAUSAL_GLOBAL_STRONG_COVERAGE_DROP = 0.55
+_CAUSAL_GLOBAL_STRONG_CENTER_CHANGE = 32.0
+
 # 当已存在 EMPTY 很少时，使用棋盘下缘和停车区之间的灰色游戏背景估计背景色。
 # 这些比例针对整个截图而不是棋盘网格；只作为首轮/极少 EMPTY 时的兜底。
 _INCREMENTAL_BG_FALLBACK_X1_N = 0.22
@@ -103,6 +109,7 @@ class CausalBoardUpdate:
     patch_confirmed_by_color: Dict[int, int]
     patch_coverage_drop_threshold: float
     patch_previous_frame_available: bool
+    strong_nonfrontier_confirmed_by_color: Dict[int, int]
 
     @property
     def complete(self) -> bool:
@@ -588,6 +595,7 @@ def update_grid_causal(
             patch_confirmed_by_color={},
             patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
             patch_previous_frame_available=bool(previous_frame_ok),
+            strong_nonfrontier_confirmed_by_color={},
         )
 
     if not expected:
@@ -602,6 +610,7 @@ def update_grid_causal(
     confirmed: Dict[int, int] = defaultdict(int)
     temporal_confirmed: Dict[int, int] = defaultdict(int)
     patch_confirmed: Dict[int, int] = defaultdict(int)
+    strong_nonfrontier_confirmed: Dict[int, int] = defaultdict(int)
     background_confirmed: Dict[int, int] = defaultdict(int)
     ambiguous_changed: Dict[int, int] = defaultdict(int)
     excess: Dict[int, int] = defaultdict(int)
@@ -750,6 +759,111 @@ def update_grid_causal(
         if newly_removed == 0:
             break
 
+    # v5.10 second-stage causal localization.
+    # Strict frontier remains the primary rule. Only unresolved capacity may
+    # use this global fallback, and only with near-certain direct visual loss.
+    if previous_frame is not None and any(v > 0 for v in remaining.values()):
+        for color in sorted(remaining):
+            budget = int(remaining.get(color, 0))
+            if budget <= 0:
+                continue
+
+            strong_candidates: List[
+                Tuple[int, float, float, Tuple[int, int]]
+            ] = []
+
+            coords = np.argwhere(
+                (prev == int(color))
+                & (grid == int(color))
+            )
+            for rr, cc in coords:
+                r, c = int(rr), int(cc)
+
+                cx, cy = _grid_cell_center(
+                    r,
+                    c,
+                    image_rgb.shape[1],
+                    image_rgb.shape[0],
+                )
+                if ui_covered(
+                    cx,
+                    cy,
+                    image_rgb.shape[1],
+                    image_rgb.shape[0],
+                ):
+                    continue
+
+                prev_cov = _sample_grid_cell_color_coverage(
+                    previous_frame,
+                    r,
+                    c,
+                    color,
+                    palette,
+                )
+                if prev_cov < _CAUSAL_GLOBAL_STRONG_PREV_COVERAGE:
+                    continue
+
+                curr_cov = _sample_grid_cell_color_coverage(
+                    image_rgb,
+                    r,
+                    c,
+                    color,
+                    palette,
+                )
+                coverage_drop = prev_cov - curr_cov
+                if curr_cov > _CAUSAL_GLOBAL_STRONG_CURR_COVERAGE_MAX:
+                    continue
+                if coverage_drop < _CAUSAL_GLOBAL_STRONG_COVERAGE_DROP:
+                    continue
+
+                current_rgb = current_grid_rgb[r, c]
+                change_dist = 0.0
+                if previous_rgb is not None:
+                    change_dist = float(
+                        np.linalg.norm(current_rgb - previous_rgb[r, c])
+                    )
+
+                is_background = _looks_like_empty_background(
+                    current_rgb,
+                    background_rgb,
+                    palette,
+                )
+                if (
+                    not is_background
+                    and change_dist < _CAUSAL_GLOBAL_STRONG_CENTER_CHANGE
+                ):
+                    continue
+
+                strong_candidates.append(
+                    (
+                        1 if is_background else 0,
+                        float(coverage_drop),
+                        float(change_dist),
+                        (r, c),
+                    )
+                )
+
+            strong_candidates.sort(
+                key=lambda item: (item[0], item[1], item[2]),
+                reverse=True,
+            )
+
+            if len(strong_candidates) > budget:
+                ambiguous_changed[color] += (
+                    len(strong_candidates) - budget
+                )
+
+            for _bg_rank, _drop, _change, (r, c) in strong_candidates[:budget]:
+                if int(grid[r, c]) != int(color):
+                    continue
+                if int(remaining.get(color, 0)) <= 0:
+                    break
+
+                grid[r, c] = EMPTY
+                confirmed[color] += 1
+                remaining[color] -= 1
+                strong_nonfrontier_confirmed[color] += 1
+
     remaining_nonzero = {
         color: count
         for color, count in sorted(remaining.items())
@@ -780,6 +894,9 @@ def update_grid_causal(
         patch_confirmed_by_color=dict(sorted(patch_confirmed.items())),
         patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
         patch_previous_frame_available=bool(previous_frame_ok),
+        strong_nonfrontier_confirmed_by_color=dict(
+            sorted(strong_nonfrontier_confirmed.items())
+        ),
     )
 
 def update_grid(
