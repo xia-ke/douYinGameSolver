@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .board import ctag, reachable_components, reachable_summary
-from .config import EMPTY, UNKNOWN
+from .config import (
+    EMPTY, UNKNOWN,
+    X_EDGE0_REF, X_STEP_REF, Y_EDGE0_REF, Y_STEP_REF,
+)
 from .models import Car, Candidate, TwoStepPlan
 
 
@@ -15,6 +18,13 @@ _QUEUE_LOOKAHEAD_WEIGHT = 0.70
 _QUEUE_LOOKAHEAD_BONUS_CAP = 120000.0
 _TWO_STEP_MIN_GAIN = 4000.0
 _TWO_STEP_MIN_FREE_SLOTS = 3
+
+
+# v5.20: nearest-cell routing is a spatial look-ahead only; it must never
+# weaken the stable 6/6 hard-safety condition.
+_NEAREST_USEFUL_EXPOSE_WEIGHT = 180.0
+_NEAREST_NEXT_EXPOSE_WEIGHT = 420.0
+_NEAREST_SCORE_BONUS_CAP = 12000.0
 
 
 @dataclass
@@ -31,6 +41,8 @@ class _FlowSimulation:
     stable_safe: bool
     exact_grid: bool
     rounds: int
+    nearest_predicted_exposed_by_color: Dict[int, int] = field(default_factory=dict)
+    nearest_predicted_removed_by_color: Dict[int, int] = field(default_factory=dict)
 
 
 def parked_remainders_by_color(parked: Sequence[Car]) -> Dict[int, List[int]]:
@@ -46,15 +58,21 @@ def guaranteed_completions_from_supply(
     remainders: Sequence[int],
     supply: int,
 ) -> int:
-    """按最坏同色分配计算至少能保证完成多少辆车。"""
-    rems = [max(1, int(x)) for x in remainders]
-    if not rems or supply <= 0:
-        return 0
+    """
+    已确认游戏规则：同色停车车优先给“剩余数字更小”的车吸收。
 
-    total_capacity = sum(rems)
-    guaranteed_moved = min(int(supply), total_capacity)
-    no_completion_max = sum(max(0, remain - 1) for remain in rems)
-    return max(0, guaranteed_moved - no_completion_max)
+    一辆车一旦先拿到色块，remain 会继续变小，因此它会持续保持优先级
+    直到归零。于是总完成数不再需要按任意分配做最坏下界，而是把 remain
+    从小到大排序，按供给依次填满即可。
+    """
+    left = max(0, int(supply))
+    completed = 0
+    for remain in sorted(max(1, int(x)) for x in remainders):
+        if left < remain:
+            break
+        left -= remain
+        completed += 1
+    return completed
 
 
 def _guaranteed_parked_completions_from_supply(
@@ -63,38 +81,28 @@ def _guaranteed_parked_completions_from_supply(
     supply: int,
 ) -> int:
     """
-    已确认游戏规则：停车位同色车按较小剩余数字优先吸收。
+    同色车统一按剩余数字从小到大吸收。
 
-    但“已停车车 vs 本轮新点击同色车”的相对优先级仍未确认，因此对
-    停车释放做安全下界时，先允许所有新点击同色车尽可能吸收；只有
-    必然剩给停车位的供给，再按停车剩余数字从小到大确定完成数量。
+    本轮新点击车进入停车区后也参与该优先级。唯一仍未确认的是“相同
+    remain 的平局顺序”，因此为了证明旧停车位一定释放，平局时故意把
+    新车排在旧停车车之前，保留硬安全下界。
     """
-    parked_rems = sorted(
-        max(1, int(x))
-        for x in parked_remainders
-    )
-    new_rems = [
-        max(1, int(x))
-        for x in new_remainders
-    ]
-    if not parked_rems or supply <= 0:
-        return 0
+    # kind: 0 = 本轮新车；1 = 已停车车。
+    # sort 后相同 remain 的新车先走，是“旧停车位释放”的保守 tie-break。
+    cars: List[Tuple[int, int]] = []
+    cars.extend((max(1, int(x)), 1) for x in parked_remainders)
+    cars.extend((max(1, int(x)), 0) for x in new_remainders)
+    cars.sort(key=lambda item: (item[0], item[1]))
 
-    total_capacity = sum(parked_rems) + sum(new_rems)
-    moved = min(int(supply), total_capacity)
-
-    parked_supply = max(0, moved - sum(new_rems))
-    if parked_supply <= 0:
-        return 0
-
-    completed = 0
-    for remain in parked_rems:
-        if parked_supply < remain:
+    left = max(0, int(supply))
+    completed_parked = 0
+    for remain, kind in cars:
+        if left < remain:
             break
-        parked_supply -= remain
-        completed += 1
-
-    return completed
+        left -= remain
+        if kind == 1:
+            completed_parked += 1
+    return completed_parked
 
 
 def _clear_reachable_color(grid: np.ndarray, color: int) -> Tuple[np.ndarray, int]:
@@ -108,6 +116,199 @@ def _clear_reachable_color(grid: np.ndarray, color: int) -> Tuple[np.ndarray, in
                 sim[r, c] = EMPTY
                 removed += 1
     return sim, removed
+
+
+def _grid_cell_center_ref(r: int, c: int) -> Tuple[float, float]:
+    """52x38 逻辑格在 940x2048 reference 坐标系中的中心。"""
+    return (
+        X_EDGE0_REF + (c + 0.5) * X_STEP_REF,
+        Y_EDGE0_REF + (r + 0.5) * Y_STEP_REF,
+    )
+
+
+def _parked_states_after_known_consumption(
+    cars: Sequence[Car],
+    consumed: int,
+) -> Optional[List[Tuple[Car, int]]]:
+    """
+    把已经由确定性清层消耗掉的供给落实到具体停车车 remain。
+
+    若两辆物理位置不同的同色车 remain 完全相同，则平局规则仍未知；
+    空间预测直接放弃，不自行用 x/slot 顺序猜赢家。
+    """
+    states: List[Tuple[Car, int]] = [
+        (car, max(1, int(car.remain)))
+        for car in cars
+        if car.remain is not None
+    ]
+    if not states:
+        return []
+
+    initial_rems = [remain for _car, remain in states]
+    if len(initial_rems) != len(set(initial_rems)):
+        return None
+
+    left = max(0, int(consumed))
+    while left > 0 and states:
+        states.sort(key=lambda item: item[1])
+        car, remain = states[0]
+        take = min(left, remain)
+        left -= take
+        remain -= take
+        if remain <= 0:
+            states.pop(0)
+        else:
+            states[0] = (car, remain)
+
+    if left > 0:
+        return []
+    return states
+
+
+def _predict_nearest_partial_consumption(
+    grid: np.ndarray,
+    color: int,
+    budget: int,
+    parked_states: List[Tuple[Car, int]],
+) -> Tuple[np.ndarray, int]:
+    """
+    按“数字小者优先 + 该车选择最近可达同色格”预测容量不足时的具体位置。
+
+    这里只产生策略前瞻，不参与 stable_safe，因此不会把预测位置变成硬安全事实。
+    """
+    sim = grid.copy()
+    left = max(0, int(budget))
+    removed = 0
+
+    while left > 0 and parked_states:
+        parked_states.sort(key=lambda item: item[1])
+
+        # 理论上初始 remain 唯一后不会产生新平局；仍做运行时保护。
+        if (
+            len(parked_states) >= 2
+            and parked_states[0][1] == parked_states[1][1]
+        ):
+            break
+
+        car, remain = parked_states[0]
+        comps, opened = reachable_components(sim)
+        rows, cols = sim.shape
+        cells: List[Tuple[int, int]] = []
+        for group in comps.get(color, []):
+            for r, c in group:
+                # A same-color connected component is eventually peelable, but the
+                # game can only move a block that currently touches the open EMPTY
+                # region (or the board bottom). Distance priority therefore applies
+                # to the *current movable frontier*, not to hidden interior cells.
+                touches_open = r == rows - 1
+                if not touches_open:
+                    for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        rr, cc = r + dr, c + dc
+                        if 0 <= rr < rows and 0 <= cc < cols and opened[rr, cc]:
+                            touches_open = True
+                            break
+                if touches_open:
+                    cells.append((r, c))
+
+        if not cells:
+            break
+
+        def distance_key(rc: Tuple[int, int]) -> Tuple[float, int, int]:
+            r, c = rc
+            x, y = _grid_cell_center_ref(r, c)
+            return (
+                (x - float(car.x)) ** 2 + (y - float(car.y)) ** 2,
+                -r,
+                c,
+            )
+
+        target_r, target_c = min(cells, key=distance_key)
+        if int(sim[target_r, target_c]) != color:
+            break
+
+        sim[target_r, target_c] = EMPTY
+        removed += 1
+        left -= 1
+        remain -= 1
+
+        if remain <= 0:
+            parked_states.pop(0)
+        else:
+            parked_states[0] = (car, remain)
+
+    return sim, removed
+
+
+def _nearest_partial_exposure_prediction(
+    base_grid: np.ndarray,
+    parked: Sequence[Car],
+    action_cars: Sequence[Car],
+    consumed_by_color: Dict[int, int],
+    cleared_by_color: Dict[int, int],
+) -> Tuple[Dict[int, int], Dict[int, int]]:
+    """
+    对“容量确实被吃掉、但旧模型不知道具体删哪格”的部分做距离前瞻。
+
+    只处理没有本轮新点击同色车的颜色：此时参与吸收的车都已经在停车位，
+    x/y 是当前稳定截图里的真实位置。若有本轮同色新车，则其最终停车槽位置
+    尚未建模，继续保持原有空间保守逻辑。
+
+    每种颜色都从同一 guaranteed base_grid 独立预测，避免不同颜色动画先后顺序
+    反过来污染 6/6 硬安全；结果仅用于候选评分。
+    """
+    action_colors = {
+        int(car.color)
+        for car in action_cars
+        if car.color is not None and car.remain is not None
+    }
+
+    parked_by_color: Dict[int, List[Car]] = defaultdict(list)
+    for car in parked:
+        if car.color is None or car.remain is None:
+            continue
+        parked_by_color[int(car.color)].append(car)
+
+    predicted_exposed: Dict[int, int] = {}
+    predicted_removed: Dict[int, int] = {}
+    before, _ = reachable_summary(base_grid)
+
+    for color, cars in parked_by_color.items():
+        if color in action_colors:
+            continue
+
+        consumed = int(consumed_by_color.get(color, 0))
+        already_cleared = int(cleared_by_color.get(color, 0))
+        partial_budget = max(0, consumed - already_cleared)
+        if partial_budget <= 0:
+            continue
+
+        states = _parked_states_after_known_consumption(cars, already_cleared)
+        if states is None or not states:
+            continue
+
+        predicted_grid, removed = _predict_nearest_partial_consumption(
+            base_grid,
+            color,
+            partial_budget,
+            states,
+        )
+        if removed <= 0:
+            continue
+
+        predicted_removed[color] = removed
+        after, _ = reachable_summary(predicted_grid)
+        for other in set(before) | set(after):
+            if other == color:
+                continue
+            delta = int(after.get(other, 0)) - int(before.get(other, 0))
+            if delta > 0:
+                # 各颜色独立 what-if，取 max 而不是求和，避免重复暴露重复计分。
+                predicted_exposed[other] = max(
+                    int(predicted_exposed.get(other, 0)),
+                    delta,
+                )
+
+    return dict(sorted(predicted_exposed.items())), dict(sorted(predicted_removed.items()))
 
 
 def simulate_clear_current_reachable_color(
@@ -143,8 +344,9 @@ def simulate_flow_closure(
 
     - 停车车与本次点击车辆同时参与吸收；
     - 只要还有同色车辆有容量，可达同色块就持续被吃；
-    - 已停车的同色车辆按“剩余数字较小优先”分流；
-    - 已停车车与本轮新点击同色车之间的相对优先级仍未知，因此跨两类车辆仍按最坏情况保证；
+    - 同色停车车按“剩余数字较小优先”持续吸收直到归零；
+    - 相同剩余数字的平局顺序仍按保守规则处理；
+    - 对位置已知的旧停车车，容量不足时额外按“最近可达同色格”做空间前瞻；
     - 若同色总剩余容量 >= 当前全部可达块，则该颜色可确定全部清空，
       从棋盘删除并继续计算下一层暴露；
     - 若容量不足以清空，则能确定这些容量一定被吃满，但具体删除位置未知，
@@ -264,6 +466,14 @@ def simulate_flow_closure(
     final_occupied_upper = max(0, total_cars_after_clicks - guaranteed_total)
     stable_safe = final_occupied_upper < slots
 
+    nearest_exposed, nearest_removed = _nearest_partial_exposure_prediction(
+        sim,
+        parked,
+        action_cars,
+        dict(consumed),
+        dict(cleared),
+    )
+
     return _FlowSimulation(
         grid=sim,
         consumed_by_color=dict(sorted(consumed.items())),
@@ -277,6 +487,8 @@ def simulate_flow_closure(
         stable_safe=stable_safe,
         exact_grid=(len(uncertain_colors) == 0),
         rounds=rounds,
+        nearest_predicted_exposed_by_color=nearest_exposed,
+        nearest_predicted_removed_by_color=nearest_removed,
     )
 
 
@@ -339,6 +551,24 @@ def _score_flow(
     else:
         score -= 1200.0
 
+    # v5.20: 距离规则只作为空间前瞻评分，不进入 hard safety / completion proof。
+    # exact 暴露仍使用上面的 450/1100 权重；nearest prediction 权重更低。
+    nearest_exposed = sim.nearest_predicted_exposed_by_color
+    if nearest_exposed:
+        nearest_useful = sum(
+            int(n) for color, n in nearest_exposed.items() if color in useful
+        )
+        nearest_next = (
+            int(nearest_exposed.get(next_color, 0))
+            if next_color is not None
+            else 0
+        )
+        nearest_bonus = (
+            min(nearest_useful, 40) * _NEAREST_USEFUL_EXPOSE_WEIGHT
+            + min(nearest_next, 25) * _NEAREST_NEXT_EXPOSE_WEIGHT
+        )
+        score += min(_NEAREST_SCORE_BONUS_CAP, nearest_bonus)
+
     return score
 
 
@@ -348,14 +578,19 @@ def _specific_action_car_completion_guaranteed(
     total_supply: int,
 ) -> bool:
     """
-    分配顺序完全未知时，要保证“这辆新点击车自己”完成，
-    最坏情况可以先把所有同色停车车喂满。
-    因此只有总供给足以填满所有同色车辆时，才能保证指定新车完成。
+    按“剩余数字小者优先”判断这辆新点击车自己是否必然完成。
+
+    remain 比它小的停车车必然先完成；remain 比它大的车不会抢在它前面。
+    相同 remain 的平局仍未知，因此为了保证该新车完成，保守地把所有相同
+    remain 的旧停车车也视为可能排在它前面。
     """
-    total = sum(max(1, int(x)) for x in parked_same_color) + max(
-        1, int(action_capacity)
+    cap = max(1, int(action_capacity))
+    supply_needed = cap + sum(
+        max(1, int(x))
+        for x in parked_same_color
+        if max(1, int(x)) <= cap
     )
-    return int(total_supply) >= total
+    return int(total_supply) >= supply_needed
 
 
 def _build_candidate(
@@ -887,6 +1122,11 @@ def format_report(
         )
 
     lines.append("")
+    lines.append(
+        "策略分流规则: 同色停车车按剩余数字小者优先；容量不足时，对位置已知的"
+        "停车车按‘最近可达同色格’做空间前瞻。距离前瞻只参与候选评分，不放松"
+        "稳定 6/6 硬安全。"
+    )
     lines.append("候选动作（按并发自动分流闭包评分）:")
     for c in candidates:
         flags: List[str] = []
@@ -968,8 +1208,8 @@ def format_report(
         )
         if best.chain_parked_completions > 0:
             lines.append(
-                f"停车释放依据: 不假设同色分配顺序，按最坏分配仍保证已有停车车 "
-                f"至少完成 {best.chain_parked_completions} 辆。"
+                f"停车释放依据: 按已确认的同色车‘剩余数字小者优先’规则，"
+                f"保证已有停车车至少完成 {best.chain_parked_completions} 辆。"
             )
         if best.queue_unlock_bonus > 0 and best.next_capacity is not None:
             lines.append(
