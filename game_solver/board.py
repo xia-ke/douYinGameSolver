@@ -1086,25 +1086,18 @@ def update_grid_causal(
     prev_image_rgb: Optional[np.ndarray] = None,
 ) -> CausalBoardUpdate:
     """
-    v5.16 visual-truth board synchronization.
+    v5.18 visual-truth board synchronization.
 
-    The responsibility split is strict:
+    Spatial truth is decided cell-by-cell by vision. Capacity conservation is
+    audit-only and never selects or truncates cell positions.
 
-      visual recognition
-          decides WHICH logical cells are EMPTY;
+    Direct current-frame background remains the strongest EMPTY evidence.
+    If the current cell is UNCERTAIN, the previous committed stable frame is
+    compared with the current stable frame and the old-color body is tracked
+    pixel-by-pixel. Strong old-color body loss may independently prove
+    COLOR -> EMPTY even when sprite/foot/shadow prevents a pure-gray patch.
 
-      capacity conservation
-          only audits HOW MANY cells should have been consumed by color.
-
-    In particular this function never:
-      - takes the top-N visual candidates because capacity says N;
-      - forces a remaining budget onto frontier cells;
-      - keeps a clearly gray historical ghost merely because this turn has
-        zero capacity change for that color.
-
-    Every stable observation re-checks all persistent colored cells.  A cell is
-    cleared only when the current stable frame independently classifies it as
-    EMPTY.  PRESENT and UNCERTAIN both preserve the previous persistent state.
+    There is no top-N by capacity anywhere.
     """
     if prev.shape != (GRID_ROWS, GRID_COLS):
         raise ValueError(
@@ -1123,15 +1116,27 @@ def update_grid_causal(
         prev_grid_rgb is not None
         and np.asarray(prev_grid_rgb).shape == (GRID_ROWS, GRID_COLS, 3)
     )
+    previous_rgb = (
+        np.asarray(prev_grid_rgb, dtype=np.float32)
+        if snapshot_ok
+        else None
+    )
+
     previous_frame_ok = (
         prev_image_rgb is not None
         and np.asarray(prev_image_rgb).shape == image_rgb.shape
+    )
+    previous_frame = (
+        np.asarray(prev_image_rgb, dtype=np.float32)
+        if previous_frame_ok
+        else None
     )
 
     grid = prev.copy()
     background_rgb = _estimate_background_rgb(prev, image_rgb)
 
     confirmed: Dict[int, int] = defaultdict(int)
+    temporal_confirmed: Dict[int, int] = defaultdict(int)
     background_confirmed: Dict[int, int] = defaultdict(int)
     reconciled_without_capacity: Dict[int, int] = defaultdict(int)
     checked_cells = 0
@@ -1143,12 +1148,7 @@ def update_grid_causal(
     if not invalid_reason:
         h, w = image_rgb.shape[:2]
 
-        # Global visual reconciliation is intentional.  A previously missed
-        # ghost may no longer be on the current frontier and may have zero
-        # current-turn capacity.  Clear it if the current stable image directly
-        # proves that the logical cell is background.
-        coords = np.argwhere(prev > 0)
-        for rr, cc in coords:
+        for rr, cc in np.argwhere(prev > 0):
             r, c = int(rr), int(cc)
             old_color = int(prev[r, c])
             checked_cells += 1
@@ -1168,23 +1168,90 @@ def update_grid_causal(
                 )
             )
 
-            if state != "EMPTY":
+            # 当前截图仍明确看到旧色主体时，绝不让时间差分覆盖它。
+            if state == "PRESENT":
                 continue
 
+            temporal_body_strong = False
+            temporal_body_very_strong = False
+            ev: Optional[_CellVisualEvidence] = None
+
+            # 时间差分只用于本轮真实参与分流的颜色。
+            # expected 的数量本身不参与位置选择。
+            if previous_frame is not None and old_color in expected:
+                ev = _cell_disappearance_evidence(
+                    previous_frame,
+                    image_rgb,
+                    current_grid_rgb,
+                    previous_rgb,
+                    r,
+                    c,
+                    old_color,
+                    palette,
+                    background_rgb,
+                )
+
+                # 不使用 ev.strong 中“中心点像背景即可”的捷径。
+                # 必须是旧色主体在 patch 多区域内真实丢失。
+                temporal_body_strong = bool(
+                    ev.loss_ratio >= _RECOG_DISAPPEAR_LOSS_RATIO
+                    and ev.change_ratio >= _RECOG_DISAPPEAR_CHANGE_RATIO
+                    and ev.stable_ratio <= _RECOG_DISAPPEAR_STABLE_MAX
+                    and ev.curr_color_coverage
+                    <= _RECOG_DISAPPEAR_CURR_COVERAGE_MAX
+                    and (
+                        ev.zone_support >= 2
+                        or ev.background_ratio >= _RECOG_DISAPPEAR_BG_RATIO
+                        or ev.strong_change_ratio >= 0.48
+                    )
+                )
+
+                temporal_body_very_strong = bool(
+                    ev.loss_ratio >= _RECOG_VERY_STRONG_LOSS_RATIO
+                    and ev.change_ratio >= _RECOG_VERY_STRONG_CHANGE_RATIO
+                    and ev.stable_ratio <= _RECOG_VERY_STRONG_STABLE_MAX
+                    and ev.curr_color_coverage
+                    <= _RECOG_VERY_STRONG_CURR_COVERAGE_MAX
+                    and (
+                        ev.zone_support >= 2
+                        or ev.background_ratio >= 0.20
+                        or ev.strong_change_ratio >= 0.68
+                    )
+                )
+
+            temporal_accept = False
+            if ev is not None:
+                if covered:
+                    temporal_accept = bool(
+                        temporal_body_very_strong
+                        and ev.background_ratio >= 0.20
+                    )
+                else:
+                    temporal_accept = bool(
+                        temporal_body_strong
+                        or temporal_body_very_strong
+                    )
+
+            if state != "EMPTY" and not temporal_accept:
+                # UNCERTAIN 保留上一 committed 状态，不猜。
+                continue
+
+            # 空间提交完全不读取容量 budget。
             grid[r, c] = EMPTY
-            confirmed[old_color] += 1
-            background_confirmed[old_color] += 1
 
-            if old_color not in expected:
-                reconciled_without_capacity[old_color] += 1
+            if state == "EMPTY":
+                if old_color in expected:
+                    confirmed[old_color] += 1
+                    background_confirmed[old_color] += 1
+                else:
+                    reconciled_without_capacity[old_color] += 1
+            else:
+                confirmed[old_color] += 1
+                temporal_confirmed[old_color] += 1
 
-        # UNKNOWN remains conservative in the causal path.  v5.16 does not
-        # globally repaint UNKNOWN cells from a single frame, because the gray
-        # background can be close to a palette center.  Only previously known
-        # COLOR cells participate in visual truth reconciliation here.
+        # UNKNOWN 仍保持保守，不做 UNKNOWN -> EMPTY。
 
-    # Capacity is an audit only.  Never use these numbers to pick cell
-    # positions or to undo visually confirmed EMPTY cells.
+    # 容量守恒仅审计总数，不 cap、不排序、不补删、不回滚。
     remaining: Dict[int, int] = {}
     excess: Dict[int, int] = {}
     for color, expected_count in sorted(expected.items()):
@@ -1194,27 +1261,34 @@ def update_grid_causal(
         elif visual_count > expected_count:
             excess[color] = visual_count - expected_count
 
+    total_removed = (
+        sum(confirmed.values())
+        + sum(reconciled_without_capacity.values())
+    )
+
     return CausalBoardUpdate(
         grid=grid,
-        removed=sum(confirmed.values()),
+        removed=total_removed,
         expected_by_color=dict(sorted(expected.items())),
         confirmed_by_color=dict(sorted(confirmed.items())),
         remaining_by_color=dict(sorted(remaining.items())),
         excess_by_color=dict(sorted(excess.items())),
         invalid_reason=invalid_reason,
         checked_cells=checked_cells,
-        temporal_confirmed_by_color={},
+        temporal_confirmed_by_color=dict(
+            sorted(temporal_confirmed.items())
+        ),
         background_confirmed_by_color=dict(
             sorted(background_confirmed.items())
         ),
         ambiguous_changed_by_color={},
         temporal_change_threshold=_RECOG_TEMPORAL_CHANGE_DIST,
         temporal_snapshot_available=bool(snapshot_ok),
-        patch_confirmed_by_color={},
+        patch_confirmed_by_color=dict(
+            sorted(temporal_confirmed.items())
+        ),
         patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
         patch_previous_frame_available=bool(previous_frame_ok),
-        # Reuse this existing telemetry field to make historical/global
-        # reconciliation visible without changing AnalysisResult serialization.
         strong_nonfrontier_confirmed_by_color=dict(
             sorted(reconciled_without_capacity.items())
         ),

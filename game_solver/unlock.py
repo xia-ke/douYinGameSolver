@@ -20,6 +20,8 @@ from .config import (
     UNLOCK_AD_RETURN_DELAY,
     UNLOCK_GAME_FRONT_MIN_COLUMNS,
     UNLOCK_GAME_FRONT_MIN_SPAN_N,
+    UNLOCK_GAME_THREE_COL_MIN_SPAN_N,
+    UNLOCK_GAME_THREE_COL_MAX_GAP_RATIO,
     UNLOCK_BUTTON_SEARCH_X1_N,
     UNLOCK_BUTTON_SEARCH_X2_N,
     UNLOCK_BUTTON_SEARCH_Y1_N,
@@ -136,25 +138,38 @@ def _looks_like_game_screen(image_bgr: np.ndarray) -> bool:
     """
     只用于广告解锁流程判断“是否已经回到新局游戏界面”。
 
-    广告页偶尔也会在第一排数字扫描带里出现两组白色文字，
-    因此不能只判断 centers 非空。
-    新局正常队列需要：
-      - 至少 3 个车辆数字中心；
-      - 最左到最右中心横跨至少屏幕宽度的 35%。
-    已验证当前 4 列和 5 列关卡均满足。
+    v5.19:
+      - 4/5列关卡继续使用原来的 >=35% 横向跨度要求；
+      - 3列关卡允许较小的天然跨度（>=30%）；
+      - 但3列时额外要求相邻车辆中心间距近似等距，
+        防止广告页三组不规则文字被误判为正常游戏队列。
     """
     try:
-        centers = detect_front_centers(image_bgr)
+        centers = sorted(float(x) for x in detect_front_centers(image_bgr))
     except Exception:
         return False
 
     if len(centers) < UNLOCK_GAME_FRONT_MIN_COLUMNS:
         return False
 
-    w = image_bgr.shape[1]
-    span = float(max(centers) - min(centers))
-    return span >= UNLOCK_GAME_FRONT_MIN_SPAN_N * w
+    w = float(image_bgr.shape[1])
+    if w <= 0:
+        return False
 
+    span_n = (centers[-1] - centers[0]) / w
+
+    if len(centers) == 3:
+        if span_n < UNLOCK_GAME_THREE_COL_MIN_SPAN_N:
+            return False
+
+        gaps = np.diff(np.asarray(centers, dtype=np.float32))
+        if len(gaps) != 2 or float(gaps.min()) <= 0:
+            return False
+
+        gap_ratio = float(gaps.max() / gaps.min())
+        return gap_ratio <= UNLOCK_GAME_THREE_COL_MAX_GAP_RATIO
+
+    return span_n >= UNLOCK_GAME_FRONT_MIN_SPAN_N
 
 def unlock_sixth_slot_at_game_start(
     *,

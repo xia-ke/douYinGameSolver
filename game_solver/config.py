@@ -138,6 +138,13 @@ UNLOCK_AD_CLOSE_RETRY_COUNT = 8
 UNLOCK_GAME_FRONT_MIN_COLUMNS = 3
 UNLOCK_GAME_FRONT_MIN_SPAN_N = 0.35
 
+# v5.19: 3列关卡的第一排横向跨度天然小于4/5列。
+# 关卡16实测三列中心约 x=316,471,624，span_n≈0.328，
+# 原统一 0.35 阈值会把正常游戏界面误判为广告/其它界面。
+# 三列时单独放宽跨度，同时要求相邻列间距近似规则。
+UNLOCK_GAME_THREE_COL_MIN_SPAN_N = 0.30
+UNLOCK_GAME_THREE_COL_MAX_GAP_RATIO = 1.35
+
 
 # “解锁”按钮动态搜索区域。
 # 实机按钮暗色主体约 115x155（940x2048 基准），固定出现在停车区右侧。
