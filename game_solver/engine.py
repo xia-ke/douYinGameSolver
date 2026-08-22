@@ -455,6 +455,14 @@ def _format_causal_board_update(
         )
         lines.append(f"  强视觉非frontier确认: {strong}")
 
+    if update.ui_unknown_confirmed_by_color:
+        ui_unknown = ", ".join(
+            f"{ctag(color)}={count}"
+            for color, count
+            in update.ui_unknown_confirmed_by_color.items()
+        )
+        lines.append(f"  UI遮挡UNKNOWN因果确认: {ui_unknown}")
+
     if update.ambiguous_changed_by_color:
         ambiguous = ", ".join(
             f"{ctag(color)}多{count}"
@@ -1634,6 +1642,7 @@ def _run_auto_flow_mode_impl(
         plan = result.two_step_plan
         execution_parts = []
         executed_actions = []
+        known_queue_count = len(result.front) + len(result.nxt)
         predicted_occupied_upper = result.best.flow_final_occupied_upper
         predicted_basis = (
             f"single {ctag(result.best.color)}x{result.best.capacity} "
@@ -1828,6 +1837,17 @@ def _run_auto_flow_mode_impl(
                 f"坐标=({x}, {y})"
             )
 
+        last_queue_car_clicked = (
+            known_queue_count > 0
+            and len(executed_actions) >= known_queue_count
+        )
+        if last_queue_car_clicked:
+            execution_parts.append(
+                "last-queue-clicked-known-before-monitor "
+                f"known_queue={known_queue_count} "
+                f"executed={len(executed_actions)}"
+            )
+
         _append_execution_update(
             log_path,
             screenshot=shot,
@@ -1863,9 +1883,47 @@ def _run_auto_flow_mode_impl(
             execution=f"monitor_end={Path(monitor_end).name if monitor_end else monitor_end}",
         )
 
-        # v5.10 confirmed rule: last queued car clicked == game complete.
-        # Parking does not need to become empty.  Check after the click batch's
-        # flow has stabilized and require two consecutive empty queue reads.
+        # v5.11 primary completion path: if the pre-click analysis proved that
+        # this click batch consumes every remaining queue entry, the confirmed
+        # game rule says the level is complete after this batch's parking flow
+        # stabilizes. Do not require post-click queue OCR.
+        if last_queue_car_clicked:
+            final_bgr = adb_capture_bgr(args.serial)
+            final_path = (
+                args.shots_dir
+                / f"game_complete_last_click_{shot_stamp()}.png"
+            )
+            save_bgr(final_path, final_bgr)
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "game-complete last queued car clicked directly; "
+                    f"known_queue={known_queue_count}; "
+                    f"executed={len(executed_actions)}; "
+                    f"final={final_path.name}; "
+                    f"parking_before_click={result.occupied_slots}/{args.slots}"
+                ),
+            )
+            display.show(
+                final_bgr,
+                stage="本局完成",
+                hint=(
+                    "本轮已经点击完分析时剩余的全部排队车辆，"
+                    "且停车分流已稳定；按已确认规则本局结束。"
+                    "停车位仍有车不影响胜利判定。"
+                ),
+            )
+            print(
+                "本轮已点击完最后一辆排队车，且停车分流已稳定；"
+                "按已确认规则本局结束。"
+                f"最终截图: {final_path}"
+            )
+            return 0
+
+        # Recovery fallback only: if the pre-click model did not prove queue
+        # exhaustion, keep the old two-frame empty visual check.
         queue_check_bgr = adb_capture_bgr(args.serial)
         queue_empty1, _queue_added1 = queue_empty_on_image(
             queue_check_bgr,
@@ -1923,6 +1981,17 @@ def _run_auto_flow_mode_impl(
                     "queue-after-click-empty-cancelled; "
                     f"confirm={queue_confirm_path.name}; "
                     "second check found queued vehicles"
+                ),
+            )
+        else:
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "queue-after-click-fallback first_empty=False; "
+                    f"known_queue={known_queue_count}; "
+                    f"executed={len(executed_actions)}"
                 ),
             )
 
