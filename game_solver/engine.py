@@ -174,6 +174,294 @@ def _resolve_decision_log_path(args: argparse.Namespace) -> Path:
     return args.shots_dir / "decision_log.txt"
 
 
+def _resolve_color_log_path(args: argparse.Namespace) -> Path:
+    path = getattr(args, "color_log", None)
+    if path is not None:
+        return Path(path)
+    return args.shots_dir / "color_log.txt"
+
+
+def _resolve_number_log_path(args: argparse.Namespace) -> Path:
+    path = getattr(args, "number_log", None)
+    if path is not None:
+        return Path(path)
+    return args.shots_dir / "number_log.txt"
+
+
+def _diagnostic_color_tag(color: Optional[int]) -> str:
+    if color is None:
+        return "UNKNOWN"
+    value = int(color)
+    if value <= 0:
+        return "UNKNOWN"
+    return ctag(value)
+
+
+def _diagnostic_number(value: Optional[int]) -> str:
+    return "UNKNOWN" if value is None else str(int(value))
+
+
+def _palette_rgb_hex(rgb: np.ndarray) -> Tuple[int, int, int, str]:
+    vals = tuple(
+        int(round(max(0.0, min(255.0, float(v)))))
+        for v in np.asarray(rgb).reshape(-1)[:3]
+    )
+    if len(vals) != 3:
+        return 0, 0, 0, "#000000"
+    r, g, b = vals
+    return r, g, b, f"#{r:02X}{g:02X}{b:02X}"
+
+
+def _append_color_observation_log(
+    log_path: Path,
+    *,
+    screenshot: Path,
+    result: AnalysisResult,
+    step_label: str,
+) -> None:
+    """
+    每次最终稳定识别后记录一份纯识别色彩快照。
+
+    内容：
+      - 当前动态 palette：C01..Cx -> RGB / HEX；
+      - 当前持久棋盘的 52x38 颜色矩阵；
+      - 每种颜色在棋盘中的格数；
+      - 排队区第一排 / 第二排颜色；
+      - 停车区颜色（按检测到的 x 坐标从左到右编号）。
+
+    只读取 AnalysisResult，不重复执行颜色识别，不影响决策流程。
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    palette = np.asarray(result.palette, dtype=np.float32)
+    grid = np.asarray(result.grid)
+
+    lines = [
+        "",
+        "=" * 120,
+        f"[COLOR_SNAPSHOT] time={timestamp}",
+        f"step={step_label}",
+        f"turn={result.turn}",
+        f"screenshot={screenshot.name}",
+        f"screenshot_path={screenshot}",
+        f"grid_rows={grid.shape[0]} grid_cols={grid.shape[1]}",
+        f"palette_count={len(palette)}",
+        f"board_update_status={result.board_update_status}",
+        "-" * 120,
+        "[PALETTE]",
+        "color | RGB             | HEX     | board_cells",
+        "------|-----------------|---------|------------",
+    ]
+
+    for idx, rgb in enumerate(palette, 1):
+        r, g, b, hex_color = _palette_rgb_hex(rgb)
+        board_cells = int(np.count_nonzero(grid == idx))
+        lines.append(
+            f"{ctag(idx):<5} | ({r:3d},{g:3d},{b:3d}) | "
+            f"{hex_color:<7} | {board_cells}"
+        )
+
+    lines.extend([
+        "",
+        "[BOARD_COLOR_COUNTS]",
+        f"EMPTY={int(np.count_nonzero(grid == 0))}",
+        f"UNKNOWN={int(np.count_nonzero(grid == UNKNOWN))}",
+    ])
+    for idx in range(1, len(palette) + 1):
+        lines.append(f"{ctag(idx)}={int(np.count_nonzero(grid == idx))}")
+
+    front_by_col = {
+        int(car.column): car
+        for car in result.front
+        if car.column is not None
+    }
+    next_by_col = {
+        int(car.column): car
+        for car in result.nxt
+        if car.column is not None
+    }
+    queue_columns = sorted(set(front_by_col) | set(next_by_col))
+
+    lines.extend([
+        "",
+        "[QUEUE_COLORS]",
+        "column | front_color | next_color",
+        "-------|-------------|-----------",
+    ])
+    if queue_columns:
+        for column in queue_columns:
+            front_car = front_by_col.get(column)
+            next_car = next_by_col.get(column)
+            lines.append(
+                f"{column:>6d} | "
+                f"{_diagnostic_color_tag(front_car.color if front_car else None):<11} | "
+                f"{_diagnostic_color_tag(next_car.color if next_car else None)}"
+            )
+    else:
+        lines.append("(empty)")
+
+    parked = sorted(result.parked, key=lambda car: float(car.x))
+    lines.extend([
+        "",
+        "[PARKING_COLORS]",
+        "order_left_to_right | x_px    | color",
+        "--------------------|---------|--------",
+    ])
+    if parked:
+        for order, car in enumerate(parked, 1):
+            lines.append(
+                f"{order:>19d} | {float(car.x):>7.1f} | "
+                f"{_diagnostic_color_tag(car.color)}"
+            )
+    else:
+        lines.append("(empty)")
+
+    lines.extend([
+        "",
+        "[BOARD_GRID]",
+        "legend: ----=EMPTY, ????=UNKNOWN, C01..Cx=recognized color",
+    ])
+
+    if grid.ndim == 2:
+        cols = int(grid.shape[1])
+        header = "row\\col | " + " ".join(
+            f"{c + 1:>4d}" for c in range(cols)
+        )
+        lines.append(header)
+        lines.append("-" * len(header))
+
+        for r in range(int(grid.shape[0])):
+            values = []
+            for c in range(cols):
+                value = int(grid[r, c])
+                if value == 0:
+                    tag = "----"
+                elif value == UNKNOWN or value < 0:
+                    tag = "????"
+                else:
+                    tag = ctag(value)
+                values.append(f"{tag:>4}")
+            lines.append(f"R{r + 1:02d}     | " + " ".join(values))
+    else:
+        lines.append(f"(unexpected grid shape: {grid.shape})")
+
+    lines.append("=" * 120)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _append_number_observation_log(
+    log_path: Path,
+    *,
+    screenshot: Path,
+    result: AnalysisResult,
+    step_label: str,
+) -> None:
+    """
+    每次最终稳定识别后记录排队区和停车区数字。
+
+    颜色只作为交叉定位列；数字字段完全来自当前 AnalysisResult，
+    不在日志阶段再次执行 OCR。
+    """
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+
+    front_by_col = {
+        int(car.column): car
+        for car in result.front
+        if car.column is not None
+    }
+    next_by_col = {
+        int(car.column): car
+        for car in result.nxt
+        if car.column is not None
+    }
+    queue_columns = sorted(set(front_by_col) | set(next_by_col))
+
+    lines = [
+        "",
+        "=" * 104,
+        f"[NUMBER_SNAPSHOT] time={timestamp}",
+        f"step={step_label}",
+        f"turn={result.turn}",
+        f"screenshot={screenshot.name}",
+        f"screenshot_path={screenshot}",
+        f"board_update_status={result.board_update_status}",
+        "-" * 104,
+        "[QUEUE_NUMBERS]",
+        "column | front_color | front_number | next_color | next_number",
+        "-------|-------------|--------------|------------|------------",
+    ]
+
+    if queue_columns:
+        for column in queue_columns:
+            front_car = front_by_col.get(column)
+            next_car = next_by_col.get(column)
+            lines.append(
+                f"{column:>6d} | "
+                f"{_diagnostic_color_tag(front_car.color if front_car else None):<11} | "
+                f"{_diagnostic_number(front_car.remain if front_car else None):<12} | "
+                f"{_diagnostic_color_tag(next_car.color if next_car else None):<10} | "
+                f"{_diagnostic_number(next_car.remain if next_car else None)}"
+            )
+    else:
+        lines.append("(empty)")
+
+    parked = sorted(result.parked, key=lambda car: float(car.x))
+    lines.extend([
+        "",
+        "[PARKING_NUMBERS]",
+        "order_left_to_right | x_px    | color   | remain_number",
+        "--------------------|---------|---------|--------------",
+    ])
+    if parked:
+        for order, car in enumerate(parked, 1):
+            lines.append(
+                f"{order:>19d} | {float(car.x):>7.1f} | "
+                f"{_diagnostic_color_tag(car.color):<7} | "
+                f"{_diagnostic_number(car.remain)}"
+            )
+    else:
+        lines.append("(empty)")
+
+    lines.extend([
+        "",
+        "[SUMMARY]",
+        f"front_detected={len(result.front)}",
+        f"next_detected={len(result.nxt)}",
+        f"parked_detected={len(result.parked)}",
+        f"occupied_slots={result.occupied_slots}",
+        "=" * 104,
+    ])
+
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def _append_observation_table_logs(
+    color_log_path: Path,
+    number_log_path: Path,
+    *,
+    screenshot: Path,
+    result: AnalysisResult,
+    step_label: str,
+) -> None:
+    """Write diagnosis-only tables for the selected stable observation."""
+    _append_color_observation_log(
+        color_log_path,
+        screenshot=screenshot,
+        result=result,
+        step_label=step_label,
+    )
+    _append_number_observation_log(
+        number_log_path,
+        screenshot=screenshot,
+        result=result,
+        step_label=step_label,
+    )
+
+
 def _append_decision_log(
     log_path: Path,
     *,
@@ -1126,10 +1414,16 @@ def run_manual_step_mode(args: argparse.Namespace) -> int:
     first = True
     reset_next = args.reset
     log_path = _resolve_decision_log_path(args)
+    color_log_path = _resolve_color_log_path(args)
+    number_log_path = _resolve_number_log_path(args)
     _append_session_marker(log_path, reset=args.reset)
+    _append_session_marker(color_log_path, reset=args.reset)
+    _append_session_marker(number_log_path, reset=args.reset)
 
     print("人工逐步调试模式。")
     print(f"决策日志: {log_path}")
+    print(f"颜色表日志: {color_log_path}")
+    print(f"数字表日志: {number_log_path}")
 
     manual_no = 0
     while True:
@@ -1156,6 +1450,13 @@ def run_manual_step_mode(args: argparse.Namespace) -> int:
         step_label = f"manual-{manual_no}"
         _append_decision_log(
             log_path,
+            screenshot=shot,
+            result=result,
+            step_label=step_label,
+        )
+        _append_observation_table_logs(
+            color_log_path,
+            number_log_path,
             screenshot=shot,
             result=result,
             step_label=step_label,
@@ -1277,10 +1578,16 @@ def _run_auto_flow_mode_impl(
     committed_analysis_rgb: Optional[np.ndarray] = None
     safety = _SafetyRuntime()
     log_path = _resolve_decision_log_path(args)
+    color_log_path = _resolve_color_log_path(args)
+    number_log_path = _resolve_number_log_path(args)
     _append_session_marker(log_path, reset=args.reset)
+    _append_session_marker(color_log_path, reset=args.reset)
+    _append_session_marker(number_log_path, reset=args.reset)
 
     print("完全自动模式已启动。按 Ctrl+C 可随时停止。")
     print(f"决策日志: {log_path}")
+    print(f"颜色表日志: {color_log_path}")
+    print(f"数字表日志: {number_log_path}")
 
     if not args.skip_sixth_slot_unlock:
         did_unlock = unlock_sixth_slot_at_game_start(
@@ -1545,6 +1852,15 @@ def _run_auto_flow_mode_impl(
         # 每一步先落盘完整决策依据，确保即使后续点击/监控异常也能追溯。
         _append_decision_log(
             log_path,
+            screenshot=shot,
+            result=result,
+            step_label=step_label,
+        )
+        # 与 decision_log 使用同一份最终稳定 AnalysisResult。
+        # RETRY_OBSERVATION 中间帧不会写入颜色/数字表。
+        _append_observation_table_logs(
+            color_log_path,
+            number_log_path,
             screenshot=shot,
             result=result,
             step_label=step_label,

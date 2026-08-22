@@ -72,6 +72,44 @@ _UI_UNKNOWN_CURR_COVERAGE_MAX = 0.20
 _UI_UNKNOWN_COVERAGE_DROP = 0.50
 _UI_UNKNOWN_CENTER_CHANGE = 32.0
 
+# v5.14: perception-first board recognition.
+#
+# A logical cell is ~21x18 px at the reference resolution.  Center 2x2 RGB
+# is too fragile when a disappearing block is covered by a car body / foot /
+# shadow, and absolute distance-to-one-palette-color is ambiguous for close
+# palette pairs.  The v5.14 classifier therefore:
+#   - uses an inner cell patch;
+#   - labels pixels by nearest palette color with a separation margin;
+#   - compares exactly the pixels that belonged to the old color;
+#   - measures loss / temporal change / transition-to-background per pixel.
+_RECOG_PATCH_HALF_X_FRAC = 0.42
+_RECOG_PATCH_HALF_Y_FRAC = 0.42
+_RECOG_PIXEL_COLOR_MAX_DIST = 54.0
+_RECOG_PIXEL_COLOR_HARD_DIST = 28.0
+_RECOG_PIXEL_COLOR_MIN_MARGIN = 7.0
+_RECOG_CELL_MIN_COLOR_PIXELS = 5
+_RECOG_CELL_MIN_COLOR_COVERAGE = 0.10
+_RECOG_CELL_MIN_WIN_MARGIN = 0.035
+
+_RECOG_PIXEL_BG_DIST = 40.0
+_RECOG_PIXEL_BG_PALETTE_MARGIN = 36.0
+
+_RECOG_TEMPORAL_CHANGE_DIST = 22.0
+_RECOG_TEMPORAL_STRONG_CHANGE_DIST = 30.0
+_RECOG_TEMPORAL_STABLE_DIST = 12.0
+
+_RECOG_DISAPPEAR_MIN_PREV_PIXELS = 5
+_RECOG_DISAPPEAR_LOSS_RATIO = 0.55
+_RECOG_DISAPPEAR_CHANGE_RATIO = 0.46
+_RECOG_DISAPPEAR_STABLE_MAX = 0.38
+_RECOG_DISAPPEAR_BG_RATIO = 0.10
+_RECOG_DISAPPEAR_CURR_COVERAGE_MAX = 0.34
+
+_RECOG_VERY_STRONG_LOSS_RATIO = 0.70
+_RECOG_VERY_STRONG_CHANGE_RATIO = 0.62
+_RECOG_VERY_STRONG_STABLE_MAX = 0.22
+_RECOG_VERY_STRONG_CURR_COVERAGE_MAX = 0.24
+
 # 当已存在 EMPTY 很少时，使用棋盘下缘和停车区之间的灰色游戏背景估计背景色。
 # 这些比例针对整个截图而不是棋盘网格；只作为首轮/极少 EMPTY 时的兜底。
 _INCREMENTAL_BG_FALLBACK_X1_N = 0.22
@@ -196,22 +234,38 @@ def sample_grid_rgb_snapshot(image_rgb: np.ndarray) -> np.ndarray:
     return snap
 
 
-def _sample_grid_cell_color_coverage(
+
+@dataclass(frozen=True)
+class _CellVisualEvidence:
+    """Pixel-level evidence that one old logical color cell disappeared."""
+
+    score: float
+    strong: bool
+    very_strong: bool
+    is_background: bool
+    center_change: float
+    prev_color_coverage: float
+    curr_color_coverage: float
+    loss_ratio: float
+    change_ratio: float
+    strong_change_ratio: float
+    stable_ratio: float
+    background_ratio: float
+    zone_support: int
+
+
+def _sample_grid_cell_inner_patch(
     image_rgb: np.ndarray,
     r: int,
     c: int,
-    color: int,
-    palette: np.ndarray,
-) -> float:
-    if color <= 0 or color > len(palette):
-        return -1.0
-
+) -> np.ndarray:
+    """Return a robust inner patch without crossing into adjacent logical cells."""
     h, w = image_rgb.shape[:2]
     x, y = _grid_cell_center(r, c, w, h)
     _x0, dx, _y0, dy = scaled_grid_geometry(w, h)
 
-    rx = max(2, int(round(dx * _CAUSAL_PATCH_HALF_X_FRAC)))
-    ry = max(2, int(round(dy * _CAUSAL_PATCH_HALF_Y_FRAC)))
+    rx = max(2, int(round(dx * _RECOG_PATCH_HALF_X_FRAC)))
+    ry = max(2, int(round(dy * _RECOG_PATCH_HALF_Y_FRAC)))
     cx = int(round(x))
     cy = int(round(y))
 
@@ -219,17 +273,331 @@ def _sample_grid_cell_color_coverage(
     x2 = min(w, cx + rx + 1)
     y1 = max(0, cy - ry)
     y2 = min(h, cy + ry + 1)
-    patch = image_rgb[y1:y2, x1:x2, :3]
-    if patch.size == 0:
-        return -1.0
+    return image_rgb[y1:y2, x1:x2, :3].astype(np.float32)
 
-    target = palette[color - 1].astype(np.float32)
+
+def _palette_pixel_labels(
+    patch_rgb: np.ndarray,
+    palette: np.ndarray,
+) -> np.ndarray:
+    """
+    Classify every pixel exclusively to at most one palette color.
+
+    This is intentionally not ``distance(target) < threshold``.  For close
+    colors (for example two palette centers only ~58 RGB units apart), a pixel
+    may satisfy the absolute threshold for both colors.  Nearest-color +
+    separation margin prevents the other color from being counted as evidence
+    that the old color is still present.
+    """
+    if patch_rgb.size == 0:
+        return np.empty(patch_rgb.shape[:2], dtype=np.int16)
+    if len(palette) == 0:
+        return np.full(patch_rgb.shape[:2], UNKNOWN, dtype=np.int16)
+
+    flat = patch_rgb.reshape(-1, 3).astype(np.float32)
+    pal = np.asarray(palette, dtype=np.float32)
     dist = np.linalg.norm(
-        patch.astype(np.float32) - target[None, None, :],
+        flat[:, None, :] - pal[None, :, :],
         axis=2,
     )
-    return float(np.mean(dist < _CAUSAL_PATCH_COLOR_DIST))
 
+    order = np.argsort(dist, axis=1)
+    best_idx = order[:, 0]
+    best_dist = dist[np.arange(len(flat)), best_idx]
+    if len(pal) >= 2:
+        second_dist = dist[np.arange(len(flat)), order[:, 1]]
+    else:
+        second_dist = np.full(len(flat), np.inf, dtype=np.float32)
+
+    hard_match = best_dist <= _RECOG_PIXEL_COLOR_HARD_DIST
+    separated_match = (
+        (best_dist <= _RECOG_PIXEL_COLOR_MAX_DIST)
+        & ((second_dist - best_dist) >= _RECOG_PIXEL_COLOR_MIN_MARGIN)
+    )
+    accepted = hard_match | separated_match
+
+    labels = np.full(len(flat), UNKNOWN, dtype=np.int16)
+    labels[accepted] = best_idx[accepted].astype(np.int16) + 1
+    return labels.reshape(patch_rgb.shape[:2])
+
+
+def _classify_grid_cell_color_patch(
+    image_rgb: np.ndarray,
+    r: int,
+    c: int,
+    palette: np.ndarray,
+) -> Tuple[Optional[int], float, float]:
+    """
+    Robust logical-cell color vote.
+
+    Returns ``(color, winner_coverage, winner_minus_runner_up)``.
+    Ambiguous/shadow/background pixels simply abstain instead of voting for the
+    nearest color.
+    """
+    patch = _sample_grid_cell_inner_patch(image_rgb, r, c)
+    labels = _palette_pixel_labels(patch, palette)
+    if labels.size == 0 or len(palette) == 0:
+        return None, 0.0, 0.0
+
+    counts = np.asarray(
+        [int(np.count_nonzero(labels == color)) for color in range(1, len(palette) + 1)],
+        dtype=np.int32,
+    )
+    winner_idx = int(np.argmax(counts))
+    winner_count = int(counts[winner_idx])
+    if winner_count < _RECOG_CELL_MIN_COLOR_PIXELS:
+        return None, 0.0, 0.0
+
+    coverage = float(winner_count / labels.size)
+    if len(counts) >= 2:
+        runner_up = int(np.partition(counts, -2)[-2])
+    else:
+        runner_up = 0
+    margin = float((winner_count - runner_up) / labels.size)
+
+    if coverage < _RECOG_CELL_MIN_COLOR_COVERAGE:
+        return None, coverage, margin
+    if margin < _RECOG_CELL_MIN_WIN_MARGIN:
+        return None, coverage, margin
+    return winner_idx + 1, coverage, margin
+
+
+def _pixel_background_mask(
+    patch_rgb: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+    palette: np.ndarray,
+) -> np.ndarray:
+    if patch_rgb.size == 0 or background_rgb is None:
+        return np.zeros(patch_rgb.shape[:2], dtype=bool)
+
+    bg_dist = np.linalg.norm(
+        patch_rgb.astype(np.float32) - background_rgb[None, None, :],
+        axis=2,
+    )
+    mask = bg_dist <= _RECOG_PIXEL_BG_DIST
+
+    if len(palette) > 0:
+        flat = patch_rgb.reshape(-1, 3).astype(np.float32)
+        pal_dist = np.linalg.norm(
+            flat[:, None, :] - np.asarray(palette, dtype=np.float32)[None, :, :],
+            axis=2,
+        )
+        nearest_palette = pal_dist.min(axis=1).reshape(patch_rgb.shape[:2])
+        mask &= nearest_palette >= _RECOG_PIXEL_BG_PALETTE_MARGIN
+    return mask
+
+
+def _cell_disappearance_evidence(
+    previous_frame: np.ndarray,
+    current_frame: np.ndarray,
+    current_grid_rgb: np.ndarray,
+    previous_grid_rgb: Optional[np.ndarray],
+    r: int,
+    c: int,
+    color: int,
+    palette: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+) -> _CellVisualEvidence:
+    """
+    Recognize disappearance by tracking old-color pixels, not patch averages.
+
+    The decisive population is: pixels that were confidently this logical
+    cell's color in the previous committed stable frame.  We ask what happened
+    to those exact pixels in the current stable frame.  This remains useful
+    when a sprite covers the cell, because "changed to another color/shadow"
+    is valid disappearance evidence while an adjacent close palette color is
+    no longer incorrectly counted as the old color.
+    """
+    prev_patch = _sample_grid_cell_inner_patch(previous_frame, r, c)
+    curr_patch = _sample_grid_cell_inner_patch(current_frame, r, c)
+
+    # Screenshots are expected to keep the same geometry.  Be defensive around
+    # edge rounding so pixel-wise comparison never broadcasts accidentally.
+    hh = min(prev_patch.shape[0], curr_patch.shape[0])
+    ww = min(prev_patch.shape[1], curr_patch.shape[1])
+    prev_patch = prev_patch[:hh, :ww]
+    curr_patch = curr_patch[:hh, :ww]
+
+    if hh == 0 or ww == 0 or not (0 < color <= len(palette)):
+        return _CellVisualEvidence(
+            0.0, False, False, False, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0,
+        )
+
+    prev_labels = _palette_pixel_labels(prev_patch, palette)
+    curr_labels = _palette_pixel_labels(curr_patch, palette)
+    prev_mask = prev_labels == int(color)
+
+    # If shading made the exclusive vote sparse, recover only pixels for which
+    # the requested old color is still the nearest palette center.  This does
+    # not let another close color vote as the old color.
+    if int(np.count_nonzero(prev_mask)) < _RECOG_DISAPPEAR_MIN_PREV_PIXELS:
+        target = np.asarray(palette[color - 1], dtype=np.float32)
+        flat = prev_patch.reshape(-1, 3)
+        d_all = np.linalg.norm(
+            flat[:, None, :] - np.asarray(palette, dtype=np.float32)[None, :, :],
+            axis=2,
+        )
+        nearest = np.argmin(d_all, axis=1).reshape(prev_patch.shape[:2])
+        target_dist = np.linalg.norm(
+            prev_patch - target[None, None, :],
+            axis=2,
+        )
+        prev_mask = (
+            (nearest == color - 1)
+            & (target_dist <= _CAUSAL_PATCH_COLOR_DIST)
+        )
+
+    prev_count = int(np.count_nonzero(prev_mask))
+    total = int(prev_mask.size)
+    prev_cov = float(prev_count / total) if total else 0.0
+    curr_cov = float(np.mean(curr_labels == int(color))) if total else 0.0
+
+    center_change = 0.0
+    if previous_grid_rgb is not None:
+        center_change = float(
+            np.linalg.norm(current_grid_rgb[r, c] - previous_grid_rgb[r, c])
+        )
+
+    center_background = _looks_like_empty_background(
+        current_grid_rgb[r, c],
+        background_rgb,
+        palette,
+    )
+
+    if prev_count < _RECOG_DISAPPEAR_MIN_PREV_PIXELS:
+        return _CellVisualEvidence(
+            float(3.0 if center_background else 0.0),
+            bool(center_background),
+            bool(center_background),
+            bool(center_background),
+            center_change,
+            prev_cov,
+            curr_cov,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0,
+        )
+
+    temporal = np.linalg.norm(curr_patch - prev_patch, axis=2)
+    curr_same = curr_labels == int(color)
+    lost = prev_mask & (~curr_same)
+    changed = prev_mask & (temporal >= _RECOG_TEMPORAL_CHANGE_DIST)
+    strong_changed = prev_mask & (temporal >= _RECOG_TEMPORAL_STRONG_CHANGE_DIST)
+    stable = (
+        prev_mask
+        & curr_same
+        & (temporal <= _RECOG_TEMPORAL_STABLE_DIST)
+    )
+    bg_mask = _pixel_background_mask(curr_patch, background_rgb, palette)
+    to_background = prev_mask & bg_mask
+
+    loss_ratio = float(np.count_nonzero(lost) / prev_count)
+    change_ratio = float(np.count_nonzero(changed) / prev_count)
+    strong_change_ratio = float(np.count_nonzero(strong_changed) / prev_count)
+    stable_ratio = float(np.count_nonzero(stable) / prev_count)
+    background_ratio = float(np.count_nonzero(to_background) / prev_count)
+
+    # 3x3 local support prevents one tiny moving sprite fragment from deciding
+    # the whole logical cell.  A real disappearance usually affects multiple
+    # portions of the old block body.
+    zone_support = 0
+    for yi in range(3):
+        y1 = (hh * yi) // 3
+        y2 = (hh * (yi + 1)) // 3
+        for xi in range(3):
+            x1 = (ww * xi) // 3
+            x2 = (ww * (xi + 1)) // 3
+            zm = prev_mask[y1:y2, x1:x2]
+            zn = int(np.count_nonzero(zm))
+            if zn < 2:
+                continue
+            zl = float(np.count_nonzero(lost[y1:y2, x1:x2] & zm) / zn)
+            zc = float(np.count_nonzero(changed[y1:y2, x1:x2] & zm) / zn)
+            zb = float(np.count_nonzero(to_background[y1:y2, x1:x2] & zm) / zn)
+            if (zl >= 0.50 and zc >= 0.40) or zb >= 0.25:
+                zone_support += 1
+
+    coverage_drop = max(0.0, prev_cov - curr_cov)
+    score = (
+        2.5 * loss_ratio
+        + 2.1 * change_ratio
+        + 1.2 * strong_change_ratio
+        + 2.8 * background_ratio
+        + 1.8 * coverage_drop
+        + 0.22 * min(zone_support, 5)
+        - 2.4 * stable_ratio
+    )
+    if center_background:
+        score += 2.0
+
+    strong = bool(
+        center_background
+        or (
+            loss_ratio >= _RECOG_DISAPPEAR_LOSS_RATIO
+            and change_ratio >= _RECOG_DISAPPEAR_CHANGE_RATIO
+            and stable_ratio <= _RECOG_DISAPPEAR_STABLE_MAX
+            and curr_cov <= _RECOG_DISAPPEAR_CURR_COVERAGE_MAX
+            and (
+                zone_support >= 2
+                or background_ratio >= _RECOG_DISAPPEAR_BG_RATIO
+                or strong_change_ratio >= 0.48
+            )
+        )
+    )
+
+    very_strong = bool(
+        center_background
+        or (
+            loss_ratio >= _RECOG_VERY_STRONG_LOSS_RATIO
+            and change_ratio >= _RECOG_VERY_STRONG_CHANGE_RATIO
+            and stable_ratio <= _RECOG_VERY_STRONG_STABLE_MAX
+            and curr_cov <= _RECOG_VERY_STRONG_CURR_COVERAGE_MAX
+            and (
+                zone_support >= 2
+                or background_ratio >= 0.20
+                or strong_change_ratio >= 0.68
+            )
+        )
+    )
+
+    return _CellVisualEvidence(
+        float(score),
+        strong,
+        very_strong,
+        bool(center_background),
+        float(center_change),
+        prev_cov,
+        curr_cov,
+        loss_ratio,
+        change_ratio,
+        strong_change_ratio,
+        stable_ratio,
+        background_ratio,
+        int(zone_support),
+    )
+
+
+def _sample_grid_cell_color_coverage(
+    image_rgb: np.ndarray,
+    r: int,
+    c: int,
+    color: int,
+    palette: np.ndarray,
+) -> float:
+    """
+    Return exclusive pixel coverage for one palette color in a logical cell.
+
+    v5.14: pixels are assigned to the nearest sufficiently separated palette
+    color.  This fixes the old failure where a nearby palette color could also
+    satisfy ``distance(target) < 44`` and be counted as survival of ``color``.
+    """
+    if color <= 0 or color > len(palette):
+        return -1.0
+
+    patch = _sample_grid_cell_inner_patch(image_rgb, r, c)
+    if patch.size == 0:
+        return -1.0
+    labels = _palette_pixel_labels(patch, palette)
+    return float(np.mean(labels == int(color)))
 
 def ui_covered(x: float, y: float, w: int, h: int) -> bool:
     """顶部固定 UI 遮挡。坐标先映射回 940x2048 再判断。"""
@@ -325,38 +693,51 @@ def learn_palette(image_rgb: np.ndarray) -> np.ndarray:
 
 
 def initial_grid(image_rgb: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    """
+    Build the initial board with robust patch voting instead of center-2x2 only.
+
+    The center sample is retained only as an extra guard inside fixed UI areas.
+    Outside UI, ambiguous pixels abstain and the logical cell is decided by
+    multiple exclusive palette-colored pixels across the cell body.
+    """
     h, w = image_rgb.shape[:2]
     x0, dx, y0, dy = scaled_grid_geometry(w, h)
-    samples, positions = grid_samples(image_rgb)
 
     grid = np.full((GRID_ROWS, GRID_COLS), UNKNOWN, dtype=np.int16)
-    for rgb, (r, c) in zip(samples, positions):
-        cx = x0 + (c + 0.5) * dx
+    if len(palette) == 0:
+        return grid
+
+    for r in range(GRID_ROWS):
         cy = y0 + (r + 0.5) * dy
+        for c in range(GRID_COLS):
+            cx = x0 + (c + 0.5) * dx
+            color, coverage, margin = _classify_grid_cell_color_patch(
+                image_rgb,
+                r,
+                c,
+                palette,
+            )
+            if color is None:
+                continue
 
-        if len(palette) == 0:
-            continue
+            if ui_covered(cx, cy, w, h):
+                # UI remains a confidence penalty.  Require both a strong patch
+                # vote and a center sample that agrees with the same color.
+                center = _sample_grid_cell(image_rgb, r, c)
+                d = np.linalg.norm(palette - center[None, :], axis=1)
+                idx = int(d.argmin())
+                if (
+                    idx + 1 == color
+                    and float(d[idx]) <= _UI_VISIBLE_CENTER_DIST
+                    and coverage >= 0.50
+                    and margin >= 0.20
+                ):
+                    grid[r, c] = int(color)
+                continue
 
-        d = np.linalg.norm(palette - rgb, axis=1)
-        idx = int(d.argmin())
-        dist = float(d[idx])
-        color = 1 + idx
+            grid[r, c] = int(color)
 
-        if ui_covered(cx, cy, w, h):
-            # Nominal UI mask lowers confidence only. If the block body is still
-            # plainly visible, keep it as a known color instead of permanent UNKNOWN.
-            if dist <= _UI_VISIBLE_CENTER_DIST:
-                coverage = _sample_grid_cell_color_coverage(
-                    image_rgb, r, c, color, palette
-                )
-                if coverage >= _UI_VISIBLE_PATCH_COVERAGE:
-                    grid[r, c] = color
-            continue
-
-        if dist < INITIAL_COLOR_DIST:
-            grid[r, c] = color
     return grid
-
 
 def open_empty_mask(grid: np.ndarray) -> np.ndarray:
     """只从棋盘下方进入；上、左、右均视为墙。"""
@@ -545,20 +926,19 @@ def update_grid_causal(
     prev_image_rgb: Optional[np.ndarray] = None,
 ) -> CausalBoardUpdate:
     """
-    使用“容量守恒 + committed stable frame 时间差分”更新棋盘。
+    Use capacity conservation plus visual recognition to localize disappeared cells.
 
-    v5.9 修正两个已由真实日志/截图证明的问题：
+    v5.14 deliberately keeps the existing causal-update process:
+      - capacity math supplies only the per-color count ceiling;
+      - physical frontier is still the primary localization path;
+      - incomplete visual localization remains incomplete;
+      - no cell is deleted merely because mathematical budget remains.
 
-    1) 不再要求所有被吸收格都必须露出纯灰背景。
-       底部 sprite 的脚/阴影/相邻块覆盖会让逻辑格已消失，但中心采样仍非灰色。
-       若某格属于当前 reachable 同色 component，且相对上一 committed 稳定截图
-       发生明显视觉变化，则它也是有效的 causal removal evidence。
-
-    2) update_grid_causal 本身完全纯函数化：
-       它只基于传入的 prev / prev_grid_rgb 生成 candidate grid，不写持久化状态。
-       观测重试必须始终从同一个 committed state 重新计算。
-
-    数量仍由 consumed_by_color 决定；视觉只负责在物理可达候选中定位具体位置。
+    What changes is perception.  COLOR->EMPTY evidence is now based on pixel-level
+    tracking of the old color body across the full logical-cell patch, with
+    exclusive nearest-palette labels, background transitions, temporal changes,
+    and multi-zone support.  This specifically targets sprite/foot/shadow
+    occlusion and close palette colors.
     """
     if prev.shape != (GRID_ROWS, GRID_COLS):
         raise ValueError(
@@ -614,7 +994,7 @@ def update_grid_causal(
             temporal_confirmed_by_color={},
             background_confirmed_by_color={},
             ambiguous_changed_by_color={},
-            temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
+            temporal_change_threshold=_RECOG_TEMPORAL_CHANGE_DIST,
             temporal_snapshot_available=bool(snapshot_ok),
             patch_confirmed_by_color={},
             patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
@@ -629,8 +1009,6 @@ def update_grid_causal(
     grid = prev.copy()
     background_rgb = _estimate_background_rgb(prev, image_rgb)
 
-    # 没有 temporal snapshot 时仍可退回纯背景证据，兼容旧 solver_state；
-    # 新局 --reset 后会自动持久化 snapshot。
     remaining = dict(expected)
     confirmed: Dict[int, int] = defaultdict(int)
     temporal_confirmed: Dict[int, int] = defaultdict(int)
@@ -642,16 +1020,10 @@ def update_grid_causal(
     excess: Dict[int, int] = defaultdict(int)
     checked_cells = 0
 
-    # 一张稳定截图中，每个格子的视觉证据固定；同一轮不用重复采样。
     checked: Set[Tuple[int, int]] = set()
 
     max_rounds = GRID_ROWS * GRID_COLS + 1
     for _round in range(max_rounds):
-        # v5.9.1 strict physical frontier:
-        # temporal diff can localize a disappearance, but it must not punch an
-        # arbitrary hole inside a reachable same-color component. Only cells
-        # touching the currently open EMPTY region are physically eligible.
-        # After confirmed removals, the next loop recomputes the frontier.
         frontier = _frontier_cells(grid)
 
         candidate_positions_by_color: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
@@ -675,17 +1047,12 @@ def update_grid_causal(
             if budget <= 0:
                 continue
 
-            # evidence tuple:
-            # (rank, change_dist, is_background, (r,c))
-            #
-            # rank:
-            #   3 = 明确灰背景
-            #   2 = strong temporal change
-            #   1 = normal temporal change
+            # (rank, score, is_background, (r,c))
             evidences: List[Tuple[int, float, bool, Tuple[int, int]]] = []
 
             for r, c in sorted(set(positions)):
                 checked.add((r, c))
+                checked_cells += 1
 
                 cx, cy = _grid_cell_center(
                     r,
@@ -693,76 +1060,103 @@ def update_grid_causal(
                     image_rgb.shape[1],
                     image_rgb.shape[0],
                 )
-                if ui_covered(
+                covered = ui_covered(
                     cx,
                     cy,
                     image_rgb.shape[1],
                     image_rgb.shape[0],
-                ):
-                    continue
+                )
 
                 current_rgb = current_grid_rgb[r, c]
-                checked_cells += 1
-
                 is_background = _looks_like_empty_background(
                     current_rgb,
                     background_rgb,
                     palette,
                 )
 
+                # Direct game background is strongest outside fixed UI.
+                if is_background and not covered:
+                    evidences.append((5, 10.0, True, (r, c)))
+                    continue
+
+                if previous_frame is not None:
+                    ev = _cell_disappearance_evidence(
+                        previous_frame,
+                        image_rgb,
+                        current_grid_rgb,
+                        previous_rgb,
+                        r,
+                        c,
+                        color,
+                        palette,
+                        background_rgb,
+                    )
+
+                    if covered:
+                        # A notification/UI overlay can change every pixel.
+                        # Under fixed UI, require very-strong evidence *and*
+                        # actual game-background transition on old-color pixels.
+                        if (
+                            ev.very_strong
+                            and ev.background_ratio >= 0.20
+                        ):
+                            evidences.append(
+                                (4, ev.score, ev.is_background, (r, c))
+                            )
+                        continue
+
+                    if ev.very_strong:
+                        evidences.append(
+                            (4, ev.score, ev.is_background, (r, c))
+                        )
+                        continue
+                    if ev.strong:
+                        evidences.append(
+                            (3, ev.score, ev.is_background, (r, c))
+                        )
+                        continue
+
+                # Backward-compatible fallback if the full previous frame is
+                # unavailable in an older solver_state.
                 change_dist = 0.0
                 if previous_rgb is not None:
                     change_dist = float(
                         np.linalg.norm(current_rgb - previous_rgb[r, c])
                     )
+                    if not covered:
+                        if change_dist >= _CAUSAL_TEMPORAL_STRONG_CHANGE_DIST:
+                            evidences.append((2, change_dist, False, (r, c)))
+                            continue
+                        if change_dist >= _CAUSAL_TEMPORAL_CHANGE_DIST:
+                            evidences.append((1, change_dist, False, (r, c)))
+                            continue
 
-                if is_background:
-                    evidences.append((3, change_dist, True, (r, c)))
-                    continue
-
-                if previous_rgb is not None:
-                    if change_dist >= _CAUSAL_TEMPORAL_STRONG_CHANGE_DIST:
-                        evidences.append((2, change_dist, False, (r, c)))
-                        continue
-                    if change_dist >= _CAUSAL_TEMPORAL_CHANGE_DIST:
-                        evidences.append((1, change_dist, False, (r, c)))
-                        continue
-
-                # v5.9.2 fallback: compare old-color body coverage in a
-                # small patch against the previous committed analysis frame.
-                if previous_frame is not None:
+                if previous_frame is not None and not covered:
                     prev_cov = _sample_grid_cell_color_coverage(
                         previous_frame, r, c, color, palette
                     )
-                    if prev_cov >= _CAUSAL_PATCH_MIN_PREV_COVERAGE:
-                        curr_cov = _sample_grid_cell_color_coverage(
-                            image_rgb, r, c, color, palette
-                        )
-                        coverage_drop = prev_cov - curr_cov
-                        if coverage_drop >= _CAUSAL_PATCH_COVERAGE_DROP:
-                            # rank 0: weaker than direct center temporal.
-                            evidences.append((0, coverage_drop, False, (r, c)))
-                            continue
-
-                # No background/center-temporal/patch-coverage evidence.
+                    curr_cov = _sample_grid_cell_color_coverage(
+                        image_rgb, r, c, color, palette
+                    )
+                    coverage_drop = prev_cov - curr_cov
+                    if (
+                        prev_cov >= _CAUSAL_PATCH_MIN_PREV_COVERAGE
+                        and coverage_drop >= _CAUSAL_PATCH_COVERAGE_DROP
+                    ):
+                        evidences.append((0, coverage_drop, False, (r, c)))
 
             if not evidences:
                 continue
 
-            # 优先：背景 > 强时间变化 > 一般时间变化；同级按变化距离降序。
             evidences.sort(
                 key=lambda item: (item[0], item[1]),
                 reverse=True,
             )
 
             if len(evidences) > budget:
-                # Experiment mode: record ambiguity but do not stall.
-                # Candidates are already restricted to the frontier.
                 ambiguous_changed[color] += len(evidences) - budget
 
-            selected = evidences[:budget]
-
-            for rank, _change_dist, is_background, (r, c) in selected:
+            for rank, _score, is_background, (r, c) in evidences[:budget]:
                 if int(grid[r, c]) != color:
                     continue
 
@@ -771,8 +1165,11 @@ def update_grid_causal(
                 remaining[color] -= 1
                 newly_removed += 1
 
-                if is_background:
+                if is_background or rank >= 5:
                     background_confirmed[color] += 1
+                elif rank >= 3:
+                    # Pixel-level temporal/body recognition.
+                    patch_confirmed[color] += 1
                 elif rank >= 1:
                     temporal_confirmed[color] += 1
                 else:
@@ -780,14 +1177,12 @@ def update_grid_causal(
 
         if all(v <= 0 for v in remaining.values()):
             break
-
-        # 已删除位置可能暴露新的异色/同色 component。
         if newly_removed == 0:
             break
 
-    # v5.10 second-stage causal localization.
-    # Strict frontier remains the primary rule. Only unresolved capacity may
-    # use this global fallback, and only with near-certain direct visual loss.
+    # Keep the existing v5.10 fallback stage, but upgrade its recognizer.
+    # Capacity still only limits count; every candidate must independently
+    # satisfy VERY_STRONG pixel-level disappearance evidence.
     if previous_frame is not None and any(v > 0 for v in remaining.values()):
         for color in sorted(remaining):
             budget = int(remaining.get(color, 0))
@@ -804,6 +1199,19 @@ def update_grid_causal(
             )
             for rr, cc in coords:
                 r, c = int(rr), int(cc)
+                ev = _cell_disappearance_evidence(
+                    previous_frame,
+                    image_rgb,
+                    current_grid_rgb,
+                    previous_rgb,
+                    r,
+                    c,
+                    color,
+                    palette,
+                    background_rgb,
+                )
+                if not ev.very_strong:
+                    continue
 
                 cx, cy = _grid_cell_center(
                     r,
@@ -811,56 +1219,22 @@ def update_grid_causal(
                     image_rgb.shape[1],
                     image_rgb.shape[0],
                 )
-
-                # No hard ui_covered veto here: this stage already requires a
-                # known old color, unresolved budget, high previous own-color
-                # coverage and near-total current disappearance.
-                prev_cov = _sample_grid_cell_color_coverage(
-                    previous_frame,
-                    r,
-                    c,
-                    color,
-                    palette,
-                )
-                if prev_cov < _CAUSAL_GLOBAL_STRONG_PREV_COVERAGE:
-                    continue
-
-                curr_cov = _sample_grid_cell_color_coverage(
-                    image_rgb,
-                    r,
-                    c,
-                    color,
-                    palette,
-                )
-                coverage_drop = prev_cov - curr_cov
-                if curr_cov > _CAUSAL_GLOBAL_STRONG_CURR_COVERAGE_MAX:
-                    continue
-                if coverage_drop < _CAUSAL_GLOBAL_STRONG_COVERAGE_DROP:
-                    continue
-
-                current_rgb = current_grid_rgb[r, c]
-                change_dist = 0.0
-                if previous_rgb is not None:
-                    change_dist = float(
-                        np.linalg.norm(current_rgb - previous_rgb[r, c])
-                    )
-
-                is_background = _looks_like_empty_background(
-                    current_rgb,
-                    background_rgb,
-                    palette,
-                )
                 if (
-                    not is_background
-                    and change_dist < _CAUSAL_GLOBAL_STRONG_CENTER_CHANGE
+                    ui_covered(
+                        cx,
+                        cy,
+                        image_rgb.shape[1],
+                        image_rgb.shape[0],
+                    )
+                    and ev.background_ratio < 0.20
                 ):
                     continue
 
                 strong_candidates.append(
                     (
-                        1 if is_background else 0,
-                        float(coverage_drop),
-                        float(change_dist),
+                        1 if ev.is_background else 0,
+                        float(ev.score),
+                        float(ev.center_change),
                         (r, c),
                     )
                 )
@@ -871,11 +1245,9 @@ def update_grid_causal(
             )
 
             if len(strong_candidates) > budget:
-                ambiguous_changed[color] += (
-                    len(strong_candidates) - budget
-                )
+                ambiguous_changed[color] += len(strong_candidates) - budget
 
-            for _bg_rank, _drop, _change, (r, c) in strong_candidates[:budget]:
+            for _bg_rank, _score, _change, (r, c) in strong_candidates[:budget]:
                 if int(grid[r, c]) != int(color):
                     continue
                 if int(remaining.get(color, 0)) <= 0:
@@ -886,13 +1258,14 @@ def update_grid_causal(
                 remaining[color] -= 1
                 strong_nonfrontier_confirmed[color] += 1
 
-    # v5.11 third-stage reconciliation for UI-covered UNKNOWN cells.
+    # Keep the existing UI-UNKNOWN reconciliation stage, but identify the old
+    # color by exclusive patch votes and require strong current disappearance.
     if previous_frame is not None and any(v > 0 for v in remaining.values()):
-        unresolved_colors = [
+        unresolved_colors = {
             int(color)
-            for color, count in sorted(remaining.items())
+            for color, count in remaining.items()
             if int(count) > 0
-        ]
+        }
         by_color: Dict[
             int,
             List[Tuple[float, float, float, Tuple[int, int]]],
@@ -919,66 +1292,36 @@ def update_grid_causal(
             ):
                 continue
 
-            coverages: List[Tuple[float, int]] = []
-            for color in unresolved_colors:
-                prev_cov = _sample_grid_cell_color_coverage(
-                    previous_frame,
-                    r,
-                    c,
-                    color,
-                    palette,
-                )
-                coverages.append((float(prev_cov), int(color)))
-
-            if not coverages:
-                continue
-            coverages.sort(reverse=True)
-            best_cov, best_color = coverages[0]
-            second_cov = coverages[1][0] if len(coverages) > 1 else 0.0
-
-            if best_cov < _UI_UNKNOWN_PREV_COVERAGE:
-                continue
-            if best_cov - second_cov < _UI_UNKNOWN_COLOR_MARGIN:
-                continue
-            if int(remaining.get(best_color, 0)) <= 0:
+            best_color, prev_cov, margin = _classify_grid_cell_color_patch(
+                previous_frame,
+                r,
+                c,
+                palette,
+            )
+            if best_color is None or best_color not in unresolved_colors:
                 continue
 
-            curr_cov = _sample_grid_cell_color_coverage(
+            ev = _cell_disappearance_evidence(
+                previous_frame,
                 image_rgb,
+                current_grid_rgb,
+                previous_rgb,
                 r,
                 c,
                 best_color,
                 palette,
-            )
-            coverage_drop = best_cov - curr_cov
-            if curr_cov > _UI_UNKNOWN_CURR_COVERAGE_MAX:
-                continue
-            if coverage_drop < _UI_UNKNOWN_COVERAGE_DROP:
-                continue
-
-            current_rgb = current_grid_rgb[r, c]
-            change_dist = 0.0
-            if previous_rgb is not None:
-                change_dist = float(
-                    np.linalg.norm(current_rgb - previous_rgb[r, c])
-                )
-
-            is_background = _looks_like_empty_background(
-                current_rgb,
                 background_rgb,
-                palette,
             )
-            if (
-                not is_background
-                and change_dist < _UI_UNKNOWN_CENTER_CHANGE
-            ):
+            if not ev.very_strong:
+                continue
+            if ev.background_ratio < 0.20 and not ev.is_background:
                 continue
 
             by_color[best_color].append(
                 (
-                    float(best_cov - second_cov),
-                    float(coverage_drop),
-                    float(change_dist),
+                    float(margin),
+                    float(ev.score),
+                    float(ev.center_change),
                     (r, c),
                 )
             )
@@ -995,7 +1338,7 @@ def update_grid_causal(
             if len(candidates) > budget:
                 ambiguous_changed[color] += len(candidates) - budget
 
-            for _margin, _drop, _change, (r, c) in candidates[:budget]:
+            for _margin, _score, _change, (r, c) in candidates[:budget]:
                 if int(grid[r, c]) != UNKNOWN:
                     continue
                 if int(remaining.get(color, 0)) <= 0:
@@ -1031,7 +1374,7 @@ def update_grid_causal(
         temporal_confirmed_by_color=dict(sorted(temporal_confirmed.items())),
         background_confirmed_by_color=dict(sorted(background_confirmed.items())),
         ambiguous_changed_by_color=dict(sorted(ambiguous_changed.items())),
-        temporal_change_threshold=_CAUSAL_TEMPORAL_CHANGE_DIST,
+        temporal_change_threshold=_RECOG_TEMPORAL_CHANGE_DIST,
         temporal_snapshot_available=bool(snapshot_ok),
         patch_confirmed_by_color=dict(sorted(patch_confirmed.items())),
         patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,

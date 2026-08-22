@@ -43,6 +43,24 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--color-log",
+        type=Path,
+        default=None,
+        help=(
+            "稳定识别颜色表日志；默认写入 <shots-dir>/color_log.txt。"
+            "记录 C01..Cx palette、52x38 棋盘颜色矩阵、排队区和停车区颜色。"
+        ),
+    )
+    parser.add_argument(
+        "--number-log",
+        type=Path,
+        default=None,
+        help=(
+            "稳定识别数字表日志；默认写入 <shots-dir>/number_log.txt。"
+            "记录排队区第一/第二排数字和停车区数字。"
+        ),
+    )
+    parser.add_argument(
         "--slots",
         type=int,
         default=DEFAULT_SLOTS,
