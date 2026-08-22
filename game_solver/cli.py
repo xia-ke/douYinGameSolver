@@ -102,8 +102,8 @@ def main() -> int:
     parser.add_argument(
         "--parking-idle-timeout",
         type=float,
-        default=8.0,
-        help="停车数字连续无变化多久算分流结束，默认 8 秒",
+        default=5.0,
+        help="停车数字连续无变化多久算分流结束，默认 5 秒",
     )
     parser.add_argument(
         "--monitor-max-failures",
