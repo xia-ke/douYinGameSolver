@@ -1043,6 +1043,57 @@ def wait_for_promoted_next_car(
 
         time.sleep(max(0.02, poll_interval))
 
+def _front_candidate_signature_on_frame(
+    frame_bgr: np.ndarray,
+    result: AnalysisResult,
+    candidate: Candidate,
+) -> Tuple[Optional[int], Optional[int]]:
+    """v5.12 click confirmation: read color/number at the old front position."""
+    car = next(
+        (c for c in result.front if c.column == candidate.column),
+        None,
+    )
+    if car is None:
+        return None, None
+    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    color = car_color_at(rgb, float(car.x), float(car.y), result.palette)
+    number, _conf, _votes = read_number_detailed_at(
+        frame_bgr,
+        float(car.x),
+        float(car.y),
+    )
+    return color, number
+
+
+def _has_distinguishable_known_next(
+    result: AnalysisResult,
+    candidate: Candidate,
+) -> bool:
+    nxt = next(
+        (c for c in result.nxt if c.column == candidate.column),
+        None,
+    )
+    if nxt is None:
+        return False
+    return (nxt.color, nxt.remain) != (candidate.color, candidate.capacity)
+
+
+def _tap_proven_not_departed(
+    frame_bgr: Optional[np.ndarray],
+    result: AnalysisResult,
+    candidate: Candidate,
+) -> bool:
+    """Return True only when a distinguishable next exists and old car remains."""
+    if frame_bgr is None or not _has_distinguishable_known_next(result, candidate):
+        return False
+    color, number = _front_candidate_signature_on_frame(
+        frame_bgr,
+        result,
+        candidate,
+    )
+    return color == candidate.color and number == candidate.capacity
+
+
 def tap_candidate_from_result(
     result: AnalysisResult,
     *,
@@ -1254,7 +1305,7 @@ def _run_auto_flow_mode_impl(
     )
     print(
         "实验模式: observation retry 只读同一 committed state；"
-        "最终只提交一次最完整观测，异常继续写日志而不形成策略 veto。"
+        "棋盘/观测异常继续记日志，但稳定停车满位仍是不可绕过的硬 veto。"
     )
 
     while True:
@@ -1616,17 +1667,17 @@ def _run_auto_flow_mode_impl(
             return 2
 
         if result.best is None:
-            # 只有“当前第一排根本没有形成任何可评分候选”才会到这里，
-            # 通常意味着 OCR/车辆识别本身没有足够信息，而不是策略 veto。
+            # v5.12: best_valid_candidate 同时承担稳定停车 hard veto。
+            # 没有安全候选时必须保持不点击，而不是为了实验继续送车入场。
             _append_execution_update(
                 log_path,
                 screenshot=shot,
                 step_label=step_label,
-                execution="NO_CANDIDATE perception-only retry; no strategy veto",
+                execution="NO_SAFE_CANDIDATE no-click; reobserve",
             )
             print(
-                "当前没有形成可评分候选（通常是车辆/OCR识别不足）；"
-                "不退出程序，立即重新截图。"
+                "当前没有可安全执行的候选；保持不点击并重新观测。"
+                "若候选均 rejected，表示点击会导致稳定停车满位。"
             )
             time.sleep(
                 max(
@@ -1750,14 +1801,35 @@ def _run_auto_flow_mode_impl(
                         f"坐标=({x2}, {y2})"
                     )
                 else:
-                    execution_parts.append(
-                        "step2-next cancelled: promote confirmation failed; "
-                        "first step remains stable-safe"
-                    )
-                    print(
-                        "连续两步第二步取消：补位未通过颜色+数字确认；"
-                        "第一步单独也已通过稳定状态安全检查。"
-                    )
+                    if _tap_proven_not_departed(
+                        _confirm_frame,
+                        result,
+                        plan.first,
+                    ):
+                        # v5.12 click confirmation: ADB tap was sent but the old
+                        # first-row car is still there. Do not invent capacity.
+                        if executed_actions and executed_actions[-1] == (
+                            int(plan.first.color),
+                            int(plan.first.capacity),
+                        ):
+                            executed_actions.pop()
+                        execution_parts.append(
+                            "step1 CLICK_NOT_CONFIRMED: original car still front; "
+                            "step2-next cancelled"
+                        )
+                        print(
+                            "第一步点击未生效：原车仍在第一排；"
+                            "不计入 executed_actions，不建立虚假容量。"
+                        )
+                    else:
+                        execution_parts.append(
+                            "step2-next cancelled: promote confirmation failed; "
+                            "step1 departure not disproven"
+                        )
+                        print(
+                            "连续两步第二步取消：补位未确认；"
+                            "但当前画面不能证明第一步漏点。"
+                        )
             else:
                 if args.double_step_gap > 0:
                     time.sleep(args.double_step_gap)
@@ -1828,14 +1900,66 @@ def _run_auto_flow_mode_impl(
                 f"{ctag(result.best.color)}x{result.best.capacity} "
                 f"xy=({x},{y})"
             )
-            executed_actions.append(
-                (int(result.best.color), int(result.best.capacity))
+            # v5.12 click confirmation: when the same column has a
+            # distinguishable known next car, briefly confirm that the original car
+            # did not simply remain after a missed ADB tap.
+            single_confirm_failed = False
+            if _has_distinguishable_known_next(result, result.best):
+                confirm_deadline = time.monotonic() + min(
+                    1.2,
+                    max(0.35, args.queue_promote_timeout),
+                )
+                last_confirm_frame = None
+                while time.monotonic() < confirm_deadline:
+                    last_confirm_frame = adb_capture_bgr(args.serial)
+                    if not _tap_proven_not_departed(
+                        last_confirm_frame,
+                        result,
+                        result.best,
+                    ):
+                        break
+                    time.sleep(max(0.03, args.queue_promote_poll_interval))
+                if _tap_proven_not_departed(
+                    last_confirm_frame,
+                    result,
+                    result.best,
+                ):
+                    single_confirm_failed = True
+
+            if single_confirm_failed:
+                execution_parts.append(
+                    "CLICK_NOT_CONFIRMED: original car still front"
+                )
+                print(
+                    "ADB 点击已发送但原车仍在第一排；"
+                    "不计入 executed_actions，重新观测。"
+                )
+            else:
+                executed_actions.append(
+                    (int(result.best.color), int(result.best.capacity))
+                )
+                print(
+                    f"自动点击完成: 第一排第 {result.best.column} 列 "
+                    f"{ctag(result.best.color)}×{result.best.capacity}，"
+                    f"坐标=({x}, {y})"
+                )
+
+        if not executed_actions:
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "; ".join(execution_parts)
+                    + "; CLICK_NOT_CONFIRMED no executed action"
+                ),
             )
             print(
-                f"自动点击完成: 第一排第 {result.best.column} 列 "
-                f"{ctag(result.best.color)}×{result.best.capacity}，"
-                f"坐标=({x}, {y})"
+                "本轮没有确认成功的点击；立即重新观测，"
+                "不进入停车监控，也不建立容量 checkpoint。"
             )
+            time.sleep(max(0.1, args.queue_promote_poll_interval))
+            continue
 
         last_queue_car_clicked = (
             known_queue_count > 0
