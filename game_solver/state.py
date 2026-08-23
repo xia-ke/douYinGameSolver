@@ -1,122 +1,135 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple
 
 import numpy as np
 
-from .config import STATE_VERSION, GRID_ROWS, GRID_COLS
+from .config import GRID_COLS, GRID_ROWS, STATE_VERSION
 
 
-def save_state(
-    path: Path,
-    palette: np.ndarray,
-    grid: np.ndarray,
-    turn: int,
-    image_w: int,
-    image_h: int,
-    parking_empty_ref: np.ndarray,
-    grid_rgb_snapshot: Optional[np.ndarray] = None,
-) -> None:
+@dataclass(frozen=True)
+class TrustedSessionState:
     """
-    保存已提交的稳定状态。
+    Previous trusted observation context for the next stable-frame analysis.
 
-    grid_rgb_snapshot 是 52x38x3 的格子中心 RGB 快照，用于下一次真实动作后的
-    temporal-diff 因果同步。它是可选字段，因此仍兼容旧调用方。
+    ``previous_trusted_grid`` is historical context only. It is never the
+    authoritative board for a newly captured frame; ``observe_board()`` must
+    reconstruct current spatial state first and may consult this context only
+    for current UNKNOWN resolution / invariant validation.
     """
+
+    palette: np.ndarray
+    previous_trusted_grid: np.ndarray
+    turn: int
+    screen_size: Tuple[int, int]
+    parking_empty_ref: np.ndarray
+    previous_trusted_grid_rgb: Optional[np.ndarray] = None
+
+
+def _validated_state(state: TrustedSessionState) -> TrustedSessionState:
+    palette = np.asarray(state.palette, dtype=np.float32)
+    grid = np.asarray(state.previous_trusted_grid, dtype=np.int16)
+    if grid.shape != (GRID_ROWS, GRID_COLS):
+        raise ValueError(
+            f"previous_trusted_grid 尺寸异常: {grid.shape}，"
+            f"期望 {(GRID_ROWS, GRID_COLS)}"
+        )
+
+    size = tuple(map(int, state.screen_size))
+    if len(size) != 2 or size[0] <= 0 or size[1] <= 0:
+        raise ValueError(f"screen_size 非法: {state.screen_size!r}")
+
+    parking_ref = np.asarray(state.parking_empty_ref, dtype=np.uint8)
+
+    snapshot: Optional[np.ndarray] = None
+    if state.previous_trusted_grid_rgb is not None:
+        snapshot = np.asarray(state.previous_trusted_grid_rgb, dtype=np.float32)
+        if snapshot.shape != (GRID_ROWS, GRID_COLS, 3):
+            raise ValueError(
+                f"previous_trusted_grid_rgb 尺寸异常: {snapshot.shape}，"
+                f"期望 {(GRID_ROWS, GRID_COLS, 3)}"
+            )
+
+    return TrustedSessionState(
+        palette=palette,
+        previous_trusted_grid=grid,
+        turn=int(state.turn),
+        screen_size=(size[0], size[1]),
+        parking_empty_ref=parking_ref,
+        previous_trusted_grid_rgb=snapshot,
+    )
+
+
+def save_state(path: Path, state: TrustedSessionState) -> None:
+    """Atomically persist exactly one previous-trusted-context schema."""
+    state = _validated_state(state)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp.npz")
 
     payload = dict(
         version=np.asarray([STATE_VERSION], dtype=np.int32),
-        palette=palette,
-        grid=grid,
-        turn=np.asarray([turn], dtype=np.int32),
-        screen_size=np.asarray([image_w, image_h], dtype=np.int32),
-        parking_empty_ref=parking_empty_ref.astype(np.uint8),
+        palette=state.palette,
+        previous_trusted_grid=state.previous_trusted_grid,
+        turn=np.asarray([state.turn], dtype=np.int32),
+        screen_size=np.asarray(state.screen_size, dtype=np.int32),
+        parking_empty_ref=state.parking_empty_ref,
     )
-    if grid_rgb_snapshot is not None:
-        snap = np.asarray(grid_rgb_snapshot, dtype=np.float32)
-        if snap.shape != (GRID_ROWS, GRID_COLS, 3):
-            raise ValueError(
-                f"grid_rgb_snapshot 尺寸异常: {snap.shape}，"
-                f"期望 {(GRID_ROWS, GRID_COLS, 3)}"
-            )
-        payload["grid_rgb_snapshot"] = snap
+    if state.previous_trusted_grid_rgb is not None:
+        payload["previous_trusted_grid_rgb"] = state.previous_trusted_grid_rgb
 
     np.savez_compressed(tmp, **payload)
     tmp.replace(path)
 
 
-def _load_state_core(
-    path: Path,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    int,
-    Tuple[int, int],
-    np.ndarray,
-    Optional[np.ndarray],
-]:
-    # Windows 下必须显式关闭 npz，否则后续原子替换状态文件时可能遇到文件占用。
+def load_state(path: Path) -> TrustedSessionState:
+    """
+    Load the canonical previous-trusted-context schema.
+
+    State v3 and earlier are deliberately not migrated internally. Their field
+    name ``grid`` encouraged treating persisted history as current authority;
+    use ``--reset`` once after this cutover instead of retaining dual readers.
+    """
     with np.load(path) as data:
         version = int(data["version"][0]) if "version" in data else 0
         if version != STATE_VERSION:
             raise RuntimeError(
                 f"状态文件版本 {version} 与当前程序版本 {STATE_VERSION} 不兼容。"
+                "Issue 004 已切换到 previous trusted context 状态格式；"
                 "请在新局使用 --reset 重建 solver_state.npz。"
             )
 
-        palette = data["palette"].astype(np.float32)
-        grid = data["grid"].astype(np.int16)
-        turn = int(data["turn"][0]) if "turn" in data else 0
-        size = tuple(map(int, data["screen_size"].tolist()))
-        parking_empty_ref = data["parking_empty_ref"].astype(np.uint8)
+        required = {
+            "palette",
+            "previous_trusted_grid",
+            "turn",
+            "screen_size",
+            "parking_empty_ref",
+        }
+        missing = sorted(required - set(data.files))
+        if missing:
+            raise RuntimeError(
+                "状态文件缺少当前格式字段: " + ", ".join(missing)
+                + "。请使用 --reset 重建 solver_state.npz。"
+            )
 
-        grid_rgb_snapshot: Optional[np.ndarray]
-        if "grid_rgb_snapshot" in data:
-            snap = data["grid_rgb_snapshot"].astype(np.float32)
-            if snap.shape == (GRID_ROWS, GRID_COLS, 3):
-                grid_rgb_snapshot = snap
-            else:
-                grid_rgb_snapshot = None
-        else:
-            grid_rgb_snapshot = None
+        snapshot = None
+        if "previous_trusted_grid_rgb" in data:
+            snapshot = data["previous_trusted_grid_rgb"].astype(np.float32)
 
-    if grid.shape != (GRID_ROWS, GRID_COLS):
-        raise RuntimeError("状态文件网格尺寸与当前程序不一致，请使用 --reset。")
+        state = TrustedSessionState(
+            palette=data["palette"].astype(np.float32),
+            previous_trusted_grid=data["previous_trusted_grid"].astype(np.int16),
+            turn=int(data["turn"][0]),
+            screen_size=tuple(map(int, data["screen_size"].tolist())),
+            parking_empty_ref=data["parking_empty_ref"].astype(np.uint8),
+            previous_trusted_grid_rgb=snapshot,
+        )
 
-    return (
-        palette,
-        grid,
-        turn,
-        (size[0], size[1]),
-        parking_empty_ref,
-        grid_rgb_snapshot,
-    )
-
-
-def load_state(
-    path: Path,
-) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int], np.ndarray]:
-    """
-    原接口保持不变，避免影响其它模块。
-    """
-    palette, grid, turn, size, parking_ref, _snapshot = _load_state_core(path)
-    return palette, grid, turn, size, parking_ref
-
-
-def load_state_with_grid_rgb(
-    path: Path,
-) -> Tuple[
-    np.ndarray,
-    np.ndarray,
-    int,
-    Tuple[int, int],
-    np.ndarray,
-    Optional[np.ndarray],
-]:
-    """
-    engine 的新接口：额外读取上一份已提交稳定截图的格子 RGB 快照。
-    """
-    return _load_state_core(path)
+    try:
+        return _validated_state(state)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"状态文件内容与当前格式不一致: {exc}。请使用 --reset。"
+        ) from exc

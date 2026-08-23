@@ -14,8 +14,7 @@ from .adb import (
     adb_capture_bgr, adb_screencap, adb_tap, save_bgr, shot_stamp,
 )
 from .board import (
-    CausalBoardUpdate, ObservedBoard, ctag, learn_palette, observe_board,
-    observed_board_to_causal_update, reachable_summary,
+    ObservedBoard, ctag, learn_palette, observe_board, reachable_summary,
 )
 from .config import FRONT_Y_N, UNKNOWN
 from .display import ClickMark, SolverDisplay
@@ -28,7 +27,7 @@ from .game_ocr import (
 )
 install_game_digit_ocr(_ocr)
 from .ocr import read_number_at
-from .state import load_state_with_grid_rgb, save_state
+from .state import TrustedSessionState, load_state, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
     format_report, format_two_step_plan,
@@ -682,105 +681,6 @@ def _actual_consumed_from_capacity_delta(
     return consumed, ""
 
 
-def _format_causal_board_update(
-    update: CausalBoardUpdate,
-) -> str:
-    if not update.expected_by_color and update.complete and update.removed == 0:
-        return "视觉棋盘更新: 本轮没有新的视觉 EMPTY，也没有容量变化。"
-
-    expected = ", ".join(
-        f"{ctag(color)}={count}"
-        for color, count in update.expected_by_color.items()
-    ) or "无"
-    confirmed = ", ".join(
-        f"{ctag(color)}={count}"
-        for color, count in update.confirmed_by_color.items()
-    ) or "无"
-
-    lines = [
-        "视觉棋盘更新:",
-        f"  容量守恒审计值: {expected}",
-        f"  当前稳定截图明确识别为空: {confirmed}",
-        f"  本轮全棋盘视觉复核 {update.checked_cells} 个已知色块",
-        (
-            "  temporal snapshot: "
-            + ("可用" if update.temporal_snapshot_available else "不可用（退回背景判定）")
-            + f"，变化阈值={update.temporal_change_threshold:.1f}"
-        ),
-    ]
-
-    if update.background_confirmed_by_color:
-        bg = ", ".join(
-            f"{ctag(color)}={count}"
-            for color, count in update.background_confirmed_by_color.items()
-        )
-        lines.append(f"  灰背景直接确认: {bg}")
-
-    if update.temporal_confirmed_by_color:
-        temporal = ", ".join(
-            f"{ctag(color)}={count}"
-            for color, count in update.temporal_confirmed_by_color.items()
-        )
-        lines.append(f"  时间差分确认: {temporal}")
-
-    lines.append(
-        "  local patch previous frame: "
-        + ("可用" if update.patch_previous_frame_available else "不可用")
-        + f"，主体覆盖下降阈值={update.patch_coverage_drop_threshold:.2f}"
-    )
-    if update.patch_confirmed_by_color:
-        patch = ", ".join(
-            f"{ctag(color)}={count}"
-            for color, count in update.patch_confirmed_by_color.items()
-        )
-        lines.append(f"  局部主体消失确认: {patch}")
-
-    if update.strong_nonfrontier_confirmed_by_color:
-        strong = ", ".join(
-            f"{ctag(color)}={count}"
-            for color, count
-            in update.strong_nonfrontier_confirmed_by_color.items()
-        )
-        lines.append(f"  历史/零容量视觉纠错: {strong}")
-
-    if update.ui_unknown_confirmed_by_color:
-        ui_unknown = ", ".join(
-            f"{ctag(color)}={count}"
-            for color, count
-            in update.ui_unknown_confirmed_by_color.items()
-        )
-        lines.append(f"  UI遮挡UNKNOWN因果确认: {ui_unknown}")
-
-    if update.ambiguous_changed_by_color:
-        ambiguous = ", ".join(
-            f"{ctag(color)}多{count}"
-            for color, count in update.ambiguous_changed_by_color.items()
-        )
-        lines.append(
-            "  额外视觉候选（仅telemetry，未按容量裁剪）: "
-            + ambiguous
-        )
-
-    if update.remaining_by_color:
-        missing = ", ".join(
-            f"{ctag(color)}缺{count}"
-            for color, count in update.remaining_by_color.items()
-        )
-        lines.append(f"  容量大于视觉确认（疑似OCR/遮挡/未稳定）: {missing}")
-
-    if update.excess_by_color:
-        excess = ", ".join(
-            f"{ctag(color)}多{count}"
-            for color, count in update.excess_by_color.items()
-        )
-        lines.append(f"  视觉确认大于容量（疑似历史ghost/OCR误差）: {excess}")
-
-    if update.invalid_reason:
-        lines.append(f"  更新异常: {update.invalid_reason}")
-
-    return "\n".join(lines)
-
-
 def _format_observed_board_observation(observation: ObservedBoard) -> str:
     health = observation.health
     lines = [
@@ -900,7 +800,6 @@ def analyze_image(
     front_ocr_reads = len(front_centers)
 
     removed_since_last: Optional[int]
-    causal_update: Optional[CausalBoardUpdate] = None
     board_observation: Optional[ObservedBoard] = None
     causal_input_invalid = ""
     board_update_status = "ok"
@@ -940,14 +839,13 @@ def analyze_image(
         parking_empty_ref = parking_roi(image_bgr)
 
     else:
-        (
-            palette,
-            prev_grid,
-            turn,
-            saved_size,
-            parking_empty_ref,
-            prev_grid_rgb,
-        ) = load_state_with_grid_rgb(state_path)
+        trusted_state = load_state(state_path)
+        palette = trusted_state.palette
+        prev_grid = trusted_state.previous_trusted_grid
+        turn = trusted_state.turn
+        saved_size = trusted_state.screen_size
+        parking_empty_ref = trusted_state.parking_empty_ref
+        prev_grid_rgb = trusted_state.previous_trusted_grid_rgb
         if saved_size != (image_w, image_h):
             raise RuntimeError(
                 f"截图尺寸从 {saved_size[0]}x{saved_size[1]} 变成 "
@@ -1002,11 +900,6 @@ def analyze_image(
         grid = board_observation.grid
         current_grid_rgb = board_observation.grid_rgb_snapshot
         removed_since_last = board_observation.removed_cells
-
-        if has_causal_context and not causal_input_invalid:
-            # Transitional diagnostics adapter only; the adapter is not a second
-            # board authority and must be removed by Issue 004/006.
-            causal_update = observed_board_to_causal_update(board_observation)
 
         if causal_input_invalid:
             board_update_status = "causal_invalid"
@@ -1140,9 +1033,6 @@ def analyze_image(
     if board_observation is not None:
         report += "\n\n" + _format_observed_board_observation(board_observation)
 
-    if causal_update is not None:
-        report += "\n\n" + _format_causal_board_update(causal_update)
-
     if soft_force_single and not local_force_single:
         report += (
             "\n\n[TWO_STEP_POLICY]\n"
@@ -1166,19 +1056,18 @@ def analyze_image(
             + palette_diag
         )
 
-    if causal_update is not None and not causal_update.complete:
+    if board_observation is not None and not board_observation.health.trusted:
         problem_colors = sorted(
-            set(causal_update.remaining_by_color)
-            | set(causal_update.excess_by_color)
+            set(board_observation.health.capacity_remaining_by_color)
+            | set(board_observation.health.capacity_excess_by_color)
         )
         report += (
-            "\n\n!!! BOARD_UPDATE_INCOMPLETE / EXPERIMENT_WARNING !!!\n"
-            "容量守恒审计值与视觉空间识别不一致。"
-            "默认严格观测门会拒绝提交并保持 NO_CLICK_UNTRUSTED；"
-            "只有显式 --experimental-continue 才允许继续诊断运行。"
-            "容量差异只做审计，绝不用于选择或补齐格子位置。"
+            "\n\n!!! OBSERVATION_UNTRUSTED / RETRY_OBSERVATION !!!\n"
+            "当前帧 ObservedBoard 未通过 trust gate。默认严格模式不提交、不点击；"
+            "history 只解析当前 UNKNOWN，capacity 只做数量审计。"
             f"\n问题颜色: "
-            f"{', '.join(ctag(c) for c in problem_colors) or '未知'}"
+            f"{', '.join(ctag(c) for c in problem_colors) or '无特定颜色'}"
+            f"\n原因: {'；'.join(board_observation.health.reasons) or '未提供'}"
         )
 
     if stable_conflicts:
@@ -1234,23 +1123,24 @@ def analyze_image(
     if state_saved:
         save_state(
             state_path,
-            palette,
-            grid,
-            turn,
-            image_w,
-            image_h,
-            parking_empty_ref,
-            grid_rgb_snapshot=current_grid_rgb,
+            TrustedSessionState(
+                palette=palette,
+                previous_trusted_grid=grid,
+                turn=turn,
+                screen_size=(image_w, image_h),
+                parking_empty_ref=parking_empty_ref,
+                previous_trusted_grid_rgb=current_grid_rgb,
+            ),
         )
 
     remaining_by_color = (
-        dict(causal_update.remaining_by_color)
-        if causal_update is not None
+        dict(board_observation.health.capacity_remaining_by_color)
+        if board_observation is not None
         else {}
     )
     excess_by_color = (
-        dict(causal_update.excess_by_color)
-        if causal_update is not None
+        dict(board_observation.health.capacity_excess_by_color)
+        if board_observation is not None
         else {}
     )
 
@@ -1625,19 +1515,19 @@ def _commit_analysis_result_state(
     result: AnalysisResult,
 ) -> None:
     """
-    v5.9 retry-safe commit：
-    一轮多个 observation 全部只读同一个 committed solver_state；
-    最终只把选中的一次结果写盘。
+    Retry-safe commit of the selected trusted observation as historical context.
+    Retry attempts remain read-only; persisted context is never current-frame authority.
     """
     save_state(
         state_path,
-        result.palette,
-        result.grid,
-        result.turn,
-        result.image_w,
-        result.image_h,
-        result.parking_empty_ref,
-        grid_rgb_snapshot=result.grid_rgb_snapshot,
+        TrustedSessionState(
+            palette=result.palette,
+            previous_trusted_grid=result.grid,
+            turn=result.turn,
+            screen_size=(result.image_w, result.image_h),
+            parking_empty_ref=result.parking_empty_ref,
+            previous_trusted_grid_rgb=result.grid_rgb_snapshot,
+        ),
     )
     result.state_saved = True
 

@@ -107,7 +107,9 @@ class AnalysisResult:
     front_ocr_reads: int
     two_step_plan: Optional[TwoStepPlan]
 
-    # v5.6：安全降级状态机需要的结构化诊断。
+    # Issue 004: legacy-shaped status fields remain only as runtime/gate
+    # compatibility and are scheduled for removal in Issue 006. Spatial
+    # authority is ObservationHealth/ObservedBoard only.
     board_update_status: str = "ok"  # ok / incomplete / causal_invalid
     board_update_remaining_by_color: Dict[int, int] = field(default_factory=dict)
     board_update_excess_by_color: Dict[int, int] = field(default_factory=dict)

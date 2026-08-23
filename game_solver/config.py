@@ -102,8 +102,8 @@ FAST_OCR_STRONG_SCORE = 0.84
 FAST_OCR_STRONG_MARGIN = 0.018
 FRONT_FINGERPRINT_CHANGE_RATIO = 0.045
 
-# 状态格式与 v4 兼容，允许同一局继续。
-STATE_VERSION = 3
+# Issue 004: canonical previous-trusted-context schema; old state requires --reset.
+STATE_VERSION = 4
 
 UNKNOWN = -1
 EMPTY = 0
