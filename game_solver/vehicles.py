@@ -8,10 +8,9 @@ import cv2
 import numpy as np
 
 from .config import *
-from .models import Car, FrontNumberCacheEntry
+from .models import Car
 from .ocr import (
-    _recognize_digit, _recognize_digit_fast_only,
-    read_number_at, read_preview_number_at,
+    read_number_at, read_preview_number_at, recognize_digit,
 )
 
 @dataclass
@@ -25,6 +24,8 @@ class ParkingDigitComponent:
     digit: Optional[int]
     score: float
     margin: float
+    hole_count: int = 0
+    ocr_source: str = ""
 
 
 @dataclass
@@ -202,8 +203,12 @@ def detect_front_centers(image_bgr: np.ndarray) -> List[float]:
             labels[ly:ly + ch, lx:lx + cw] == label_id
         ).astype(np.uint8)
 
-        digit, score, _margin = _recognize_digit_fast_only(digit_mask)
-        if digit is None or digit == 0 or score < 0.72:
+        digit_result = recognize_digit(
+            digit_mask,
+            source="front-column-singleton",
+        )
+        digit = digit_result.digit if digit_result.accepted else None
+        if digit is None or digit == 0 or digit_result.score < 0.72:
             continue
 
         centers.append(float(ax + cw / 2.0))
@@ -244,81 +249,10 @@ def read_preview_numbers_at_centers(
     return out
 
 
-def _front_number_fingerprint(image_bgr: np.ndarray, cx: float, cy: float) -> np.ndarray:
-    """
-    固定位置提取第一排数字区域的白色像素指纹。
-    不识别数字，只判断这一列画面是否和上一轮相同。
-    """
-    h, w = image_bgr.shape[:2]
-    sx = w / REF_W
-    sy = h / REF_H
-    x1 = max(0, int(cx - 50 * sx))
-    x2 = min(w, int(cx + 50 * sx))
-    y1 = max(0, int(cy - 95 * sy))
-    y2 = min(h, int(cy - 5 * sy))
-    crop = image_bgr[y1:y2, x1:x2]
-
-    if crop.size == 0:
-        return np.zeros((48, 64), dtype=np.uint8)
-
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    mask = ((hsv[:, :, 1] < 105) & (hsv[:, :, 2] > 150)).astype(np.uint8)
-    mask = cv2.medianBlur(mask * 255, 3)
-    return cv2.resize(mask, (64, 48), interpolation=cv2.INTER_NEAREST)
-
-
-def _fingerprint_change_ratio(a: np.ndarray, b: np.ndarray) -> float:
-    if a.shape != b.shape:
-        return 1.0
-    aa = a > 0
-    bb = b > 0
-    return float(np.mean(aa != bb))
-
-
 def read_front_numbers(image_bgr: np.ndarray) -> Dict[int, Optional[int]]:
     """动态发现第一排列中心后读取数字。"""
     centers = detect_front_centers(image_bgr)
     return read_front_numbers_at_centers(image_bgr, centers)
-
-
-def read_front_numbers_cached(
-    image_bgr: np.ndarray,
-    centers_x: Sequence[float],
-    cache: Optional[Dict[int, FrontNumberCacheEntry]],
-) -> Tuple[Dict[int, Optional[int]], Dict[int, FrontNumberCacheEntry], int]:
-    """
-    动态列版视觉缓存。
-
-    只有当前检测到的列数与上轮相同，且对应列数字区域视觉指纹基本没变，
-    才复用上轮 OCR。列数发生变化时全部重读，避免跨布局错误复用。
-    """
-    h, _w = image_bgr.shape[:2]
-    old = cache or {}
-    cache_compatible = len(old) == len(centers_x)
-
-    out: Dict[int, Optional[int]] = {}
-    new_cache: Dict[int, FrontNumberCacheEntry] = {}
-    ocr_reads = 0
-
-    cy = FRONT_Y_N * h
-
-    for i, cx in enumerate(centers_x, 1):
-        fp = _front_number_fingerprint(image_bgr, float(cx), cy)
-        prev = old.get(i) if cache_compatible else None
-
-        if prev is not None:
-            change = _fingerprint_change_ratio(prev.fingerprint, fp)
-            if change < FRONT_FINGERPRINT_CHANGE_RATIO:
-                out[i] = prev.value
-                new_cache[i] = FrontNumberCacheEntry(prev.value, fp)
-                continue
-
-        value = read_number_at(image_bgr, float(cx), cy)
-        ocr_reads += 1
-        out[i] = value
-        new_cache[i] = FrontNumberCacheEntry(value, fp)
-
-    return out, new_cache, ocr_reads
 
 
 def extend_palette_from_front_numbers(
@@ -462,10 +396,13 @@ def _extract_parking_digit_components(
             continue
 
         mask = (labels[y:y + ch, x:x + cw] == label_id).astype(np.uint8)
-        if full_ocr:
-            digit, score, margin = _recognize_digit(mask)
-        else:
-            digit, score, margin = _recognize_digit_fast_only(mask)
+        digit_result = recognize_digit(
+            mask,
+            source=("parking-full" if full_ocr else "parking-fast"),
+        )
+        digit = digit_result.digit if digit_result.accepted else None
+        score = digit_result.score
+        margin = digit_result.margin
 
         if digit is None or score < PARK_DIGIT_SHAPE_MIN_SCORE:
             continue
@@ -480,6 +417,8 @@ def _extract_parking_digit_components(
             digit=digit,
             score=float(score),
             margin=float(margin),
+            hole_count=int(digit_result.hole_count),
+            ocr_source=digit_result.source,
         ))
 
     return comps, labels, raw, (x1, y1, x2, y2)

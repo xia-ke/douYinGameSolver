@@ -18,25 +18,17 @@ from .board import (
 )
 from .config import FRONT_Y_N, UNKNOWN
 from .display import ClickMark, SolverDisplay
-from .models import AnalysisResult, Candidate, FrontNumberCacheEntry, TwoStepPlan
+from .models import AnalysisResult, Candidate, TwoStepPlan
 from .monitor import wait_for_parking_idle
-from . import ocr as _ocr
-from .game_ocr import (
-    install_game_digit_ocr,
-    read_number_detailed_at,
-)
-install_game_digit_ocr(_ocr)
-from .ocr import read_number_at
+from .ocr import read_number_at, read_number_detailed_at
 from .state import TrustedSessionState, load_state, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
     format_report, format_two_step_plan,
 )
 from .unlock import unlock_sixth_slot_at_game_start
-from . import vehicles as _vehicles
-install_game_digit_ocr(_ocr, _vehicles)
 from .vehicles import (
-    _front_number_fingerprint, car_color_at, detect_front_and_next,
+    car_color_at, detect_front_and_next,
     detect_front_centers, detect_parked, extend_palette_from_front_numbers,
     parking_roi, read_front_numbers_at_centers,
 )
@@ -749,7 +741,6 @@ def analyze_image(
     state_path: Path,
     reset: bool,
     slots: int,
-    front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None,
     flow_capacity_before_by_color: Optional[Dict[int, int]] = None,
     strategy_untrusted_colors: Optional[Set[int]] = None,
     force_single_step: bool = False,
@@ -780,23 +771,12 @@ def analyze_image(
 
     front_centers = detect_front_centers(image_bgr)
 
-    # 安全模式下暂不跨车辆复用数字缓存。
-    del front_number_cache
+    # Every stable observation reads the visible first-row numbers directly.
+    # The retired fingerprint cache was explicitly disabled before every use.
     front_numbers = read_front_numbers_at_centers(
         image_bgr,
         front_centers,
     )
-    new_front_cache = {
-        i: FrontNumberCacheEntry(
-            front_numbers.get(i),
-            _front_number_fingerprint(
-                image_bgr,
-                float(cx),
-                FRONT_Y_N * image_h,
-            ),
-        )
-        for i, cx in enumerate(front_centers, 1)
-    }
     front_ocr_reads = len(front_centers)
 
     removed_since_last: Optional[int]
@@ -1158,7 +1138,6 @@ def analyze_image(
         parking_empty_ref=parking_empty_ref,
         occupied_slots=occupied_slots,
         new_colors_added=new_colors_added,
-        front_number_cache=new_front_cache,
         front_ocr_reads=front_ocr_reads,
         two_step_plan=two_step_plan,
         board_update_status=board_update_status,
@@ -1250,11 +1229,15 @@ def wait_for_promoted_next_car(
         frame = adb_capture_bgr(serial)
         last_frame = frame
 
-        last_num, last_num_conf, last_num_votes = read_number_detailed_at(
+        promoted_ocr = read_number_detailed_at(
             frame,
             float(x),
             float(y),
+            source="queue-promote",
         )
+        last_num = promoted_ocr.value
+        last_num_conf = promoted_ocr.confidence
+        last_num_votes = promoted_ocr.agreeing_crops
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32)
         last_color = car_color_at(
@@ -1601,7 +1584,6 @@ def _run_auto_flow_mode_impl(
 ) -> int:
     reset_current = args.reset
     round_no = 0
-    front_number_cache: Optional[Dict[int, FrontNumberCacheEntry]] = None
     pending_prediction: Optional[Tuple[int, str, str]] = None
     pending_flow_capacity_before_by_color: Optional[Dict[int, int]] = None
     committed_analysis_rgb: Optional[np.ndarray] = None
@@ -1725,7 +1707,6 @@ def _run_auto_flow_mode_impl(
                     args.state,
                     reset=(reset_current or not args.state.exists()),
                     slots=args.slots,
-                    front_number_cache=front_number_cache,
                     flow_capacity_before_by_color=flow_context,
                     strategy_untrusted_colors=safety.untrusted_colors,
                     force_single_step=safety.force_single_step,
@@ -1902,7 +1883,6 @@ def _run_auto_flow_mode_impl(
             ).astype(np.float32)
 
         reset_current = False
-        front_number_cache = result.front_number_cache
         sync_pending = not observation_trusted
 
         # 只有走过 observation gate 的观测才结束上一动作 checkpoint。
@@ -1925,8 +1905,8 @@ def _run_auto_flow_mode_impl(
 
         print(result.report)
         print(
-            f"OCR信息: 本轮第一排完整 OCR {result.front_ocr_reads}/"
-            f"{len(result.front_number_cache)} 列；安全模式下暂不跨车辆复用数字缓存。"
+            f"OCR信息: 本轮第一排直接 OCR {result.front_ocr_reads} 列；"
+            "每个稳定 observation 均重新读取，不跨车辆复用旧数字。"
         )
 
         # 每一步先落盘完整决策依据，确保即使后续点击/监控异常也能追溯。

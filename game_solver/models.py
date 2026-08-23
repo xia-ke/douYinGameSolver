@@ -70,12 +70,6 @@ class TwoStepPlan:
 
 
 @dataclass
-class FrontNumberCacheEntry:
-    value: Optional[int]
-    fingerprint: np.ndarray
-
-
-@dataclass
 class ObservationHealth:
     """Structured trust result for one current stable-frame board observation."""
 
@@ -103,7 +97,6 @@ class AnalysisResult:
     parking_empty_ref: np.ndarray
     occupied_slots: int
     new_colors_added: int
-    front_number_cache: Dict[int, FrontNumberCacheEntry]
     front_ocr_reads: int
     two_step_plan: Optional[TwoStepPlan]
 
