@@ -1573,6 +1573,25 @@ def _observation_quality(result: AnalysisResult) -> Tuple[int, int, int]:
         return (1, remaining + excess, -int(np.count_nonzero(result.grid == 0)))
     return (2, 10**9, 0)
 
+
+def _observation_trust(
+    result: AnalysisResult,
+) -> Tuple[bool, Tuple[str, ...]]:
+    """Return whether an analysis is trusted enough to commit and plan."""
+    reasons: List[str] = []
+    status = str(getattr(result, "board_update_status", "") or "unknown").strip()
+    if status != "ok":
+        reasons.append(f"board_update_status={status}")
+
+    causal_invalid = str(
+        getattr(result, "causal_input_invalid", "") or ""
+    ).strip()
+    if causal_invalid:
+        reasons.append(f"causal_input_invalid={causal_invalid}")
+
+    return (len(reasons) == 0), tuple(reasons)
+
+
 def run_auto_flow_mode(args: argparse.Namespace) -> int:
     display = SolverDisplay(
         enabled=not args.no_display,
@@ -1604,6 +1623,9 @@ def _run_auto_flow_mode_impl(
     _append_session_marker(log_path, reset=args.reset)
     _append_session_marker(color_log_path, reset=args.reset)
     _append_session_marker(number_log_path, reset=args.reset)
+    experimental_continue = bool(
+        getattr(args, "experimental_continue", False)
+    )
 
     print("完全自动模式已启动。按 Ctrl+C 可随时停止。")
     print(f"决策日志: {log_path}")
@@ -1631,10 +1653,16 @@ def _run_auto_flow_mode_impl(
         "策略模型: 多车并发吸收 + 自动分流闭包；"
         "稳定后停车占用最坏上界必须 < 总停车位。"
     )
-    print(
-        "实验模式: observation retry 只读同一 committed state；"
-        "棋盘/观测异常继续记日志，但稳定停车满位仍是不可绕过的硬 veto。"
-    )
+    if experimental_continue:
+        print(
+            "EXPERIMENTAL_CONTINUE 已启用：bounded retry 后仍不可信的观测"
+            "允许提交保守状态并继续；仅用于诊断实验。"
+        )
+    else:
+        print(
+            "严格观测门已启用：bounded retry 后仍不可信则 NO_CLICK_UNTRUSTED；"
+            "不提交状态、不结束 checkpoint、不执行 ADB 点击。"
+        )
 
     while True:
         round_no += 1
@@ -1763,9 +1791,10 @@ def _run_auto_flow_mode_impl(
                 best_observation_shot = shot
                 best_observation_bgr = analysis_bgr
 
-            # 容量守恒无效或棋盘预算没有落实完整：先重新截图，不立即降级/退出。
+            # 不可信观测先 bounded retry；retry 期间绝不提交状态或点击。
+            attempt_trusted, attempt_untrusted_reasons = _observation_trust(result)
             if (
-                result.board_update_status in ("incomplete", "causal_invalid")
+                not attempt_trusted
                 and observation_attempt < max_observation_attempts
             ):
                 _append_execution_update(
@@ -1775,10 +1804,9 @@ def _run_auto_flow_mode_impl(
                     execution=(
                         "RETRY_OBSERVATION "
                         f"attempt={observation_attempt}/{max_observation_attempts}; "
-                        f"board_status={result.board_update_status}; "
+                        f"reasons={'; '.join(attempt_untrusted_reasons)}; "
                         f"remaining={result.board_update_remaining_by_color}; "
-                        f"excess={result.board_update_excess_by_color}; "
-                        f"causal_invalid={result.causal_input_invalid or 'none'}"
+                        f"excess={result.board_update_excess_by_color}"
                     ),
                 )
                 time.sleep(retry_delay)
@@ -1792,8 +1820,6 @@ def _run_auto_flow_mode_impl(
             result = best_observation_result
             shot = best_observation_shot
             analysis_bgr = best_observation_bgr
-
-        reset_current = False
 
         if result is None:
             print(
@@ -1820,8 +1846,65 @@ def _run_auto_flow_mode_impl(
 
         assert shot is not None
 
-        # v5.9.2 experiment mode: commit the best conservative
-        # observation and continue; incomplete sync is telemetry.
+        observation_trusted, untrusted_reasons = _observation_trust(result)
+        untrusted_reason_text = "; ".join(untrusted_reasons) or "none"
+
+        if not observation_trusted and not experimental_continue:
+            result.report += (
+                "\n\n[NO_CLICK_UNTRUSTED]\n"
+                f"reasons={untrusted_reason_text}\n"
+                "严格模式拒绝本轮观测：不提交 solver_state、不结束上一动作 "
+                "checkpoint、不进入候选点击；保留诊断结果并继续重新观测。"
+            )
+            print(result.report)
+            _append_decision_log(
+                log_path,
+                screenshot=shot,
+                result=result,
+                step_label=step_label,
+            )
+            _append_observation_table_logs(
+                color_log_path,
+                number_log_path,
+                screenshot=shot,
+                result=result,
+                step_label=step_label,
+            )
+            _append_execution_update(
+                log_path,
+                screenshot=shot,
+                step_label=step_label,
+                execution=(
+                    "NO_CLICK_UNTRUSTED; "
+                    f"reasons={untrusted_reason_text}; "
+                    "committed-state-unchanged; pending-checkpoint-preserved"
+                ),
+            )
+            if analysis_bgr is not None:
+                display.show(
+                    analysis_bgr,
+                    stage="NO_CLICK_UNTRUSTED",
+                    hint=(
+                        "重试后观测仍不可信；严格模式保持上一份 trusted state，"
+                        "不点击，继续重新观测。"
+                    ),
+                )
+            print(
+                "NO_CLICK_UNTRUSTED：重试后观测仍不可信；"
+                "未提交状态、未结束 checkpoint、未执行点击。"
+            )
+            time.sleep(retry_delay)
+            continue
+
+        if not observation_trusted:
+            result.report += (
+                "\n\n[EXPERIMENT_CONTINUE_UNTRUSTED]\n"
+                f"reasons={untrusted_reason_text}\n"
+                "--experimental-continue 已显式启用；允许提交当前保守 grid "
+                "并继续诊断运行。"
+            )
+
+        # 只有可信观测，或显式 experimental opt-in，才允许推进 committed state。
         _commit_analysis_result_state(args.state, result)
         if analysis_bgr is not None:
             committed_analysis_rgb = cv2.cvtColor(
@@ -1829,24 +1912,11 @@ def _run_auto_flow_mode_impl(
                 cv2.COLOR_BGR2RGB,
             ).astype(np.float32)
 
+        reset_current = False
         front_number_cache = result.front_number_cache
+        sync_pending = not observation_trusted
 
-        # ----- v5.8 实验模式：异常只记录，不阻止游戏继续 -----
-        sync_pending = result.board_update_status in (
-            "incomplete",
-            "causal_invalid",
-        )
-
-        if sync_pending:
-            result.report += (
-                "\n\n[EXPERIMENT_WARNING]\n"
-                "本轮棋盘因果同步不完整，但实验模式不会暂停。"
-                "已提交当前保守 grid；旧 checkpoint 在这里结束，"
-                "未落实数量不跨动作 carry。"
-            )
-
-        # 无论本轮是否完整，都结束上一动作 checkpoint，
-        # 避免历史 unresolved consumption 污染新动作。
+        # 只有走过 observation gate 的观测才结束上一动作 checkpoint。
         pending_flow_capacity_before_by_color = None
         pending_prediction = None
 
@@ -1887,13 +1957,14 @@ def _run_auto_flow_mode_impl(
             step_label=step_label,
         )
 
-        if result.board_update_status in ("incomplete", "causal_invalid"):
+        if sync_pending:
             _append_execution_update(
                 log_path,
                 screenshot=shot,
                 step_label=step_label,
                 execution=(
-                    "EXPERIMENT_WARNING board-sync-incomplete; "
+                    "EXPERIMENT_CONTINUE_UNTRUSTED; "
+                    f"reasons={untrusted_reason_text}; "
                     "continue-with-conservative-grid; "
                     + safety.status_line()
                 ),
@@ -1901,15 +1972,15 @@ def _run_auto_flow_mode_impl(
             if analysis_bgr is not None:
                 display.show(
                     analysis_bgr,
-                    stage="实验模式 · 棋盘同步警告",
+                    stage="实验继续 · 不可信观测",
                     hint=(
-                        "上一动作棋盘变化未完全解释；当前保守状态已写日志，"
-                        "继续执行评分最高的单步候选。"
+                        "--experimental-continue 已显式启用；当前保守状态已提交，"
+                        "继续执行候选，仅用于诊断实验。"
                     ),
                 )
             print(
-                "EXPERIMENT_WARNING：棋盘同步未完全解释，"
-                "但不中断运行；继续使用当前保守 grid 做下一步实验。"
+                "EXPERIMENT_CONTINUE_UNTRUSTED：显式实验开关已启用；"
+                "继续使用当前保守 grid。"
             )
 
         if len(result.front) == 0 and len(result.nxt) == 0:

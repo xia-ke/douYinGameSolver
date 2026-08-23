@@ -11,7 +11,10 @@ from .engine import analyze_image, run_auto_flow_mode, run_manual_step_mode
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="游戏截图滚动求解器 v5.9：时间差分因果同步 + retry只读提交 + 实验优先运行"
+        description=(
+            "游戏截图滚动求解器：稳定观测 + retry 只读提交 + "
+            "默认严格 no-click gate"
+        )
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--adb", action="store_true", help="使用 ADB")
@@ -161,6 +164,14 @@ def main() -> int:
         type=float,
         default=0.45,
         help="RETRY_OBSERVATION 两次截图之间等待秒数，默认 0.45",
+    )
+    parser.add_argument(
+        "--experimental-continue",
+        action="store_true",
+        help=(
+            "显式允许自动模式在 bounded retry 后仍对 incomplete/causal_invalid "
+            "观测提交保守状态并继续点击；默认关闭，仅用于诊断实验。"
+        ),
     )
     parser.add_argument(
         "--safe-pause-retry-delay",
