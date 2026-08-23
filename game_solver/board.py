@@ -1117,6 +1117,40 @@ def _temporal_old_color_disappeared(
     return bool(strong or very_strong)
 
 
+def _apply_persistent_empty_invariant(
+    current_grid: np.ndarray,
+    evidence_by_cell: Dict[Tuple[int, int], str],
+    previous_grid: np.ndarray,
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], str], int]:
+    """
+    Preserve a previously confirmed logical EMPTY against direct sprite spill.
+
+    Once a block has been consumed, that logical board cell cannot contain a
+    block again. A later stable screenshot may still paint pixels from a
+    neighboring surviving block inside the empty cell (body/feet/shadow).
+    Such a direct COLOR vote is rendering contamination, not a legal
+    EMPTY -> COLOR transition.
+
+    Capacity data is deliberately absent.
+    """
+    grid = current_grid.copy()
+    evidence = dict(evidence_by_cell)
+
+    overridden = np.argwhere(
+        (previous_grid == EMPTY) & (current_grid > 0)
+    )
+    for rr, cc in overridden:
+        r, c = int(rr), int(cc)
+        direct = int(current_grid[r, c])
+        grid[r, c] = EMPTY
+        evidence[(r, c)] = evidence.get((r, c), "") + (
+            "|history:empty-invariant-overrides-direct-color:"
+            f"direct={ctag(direct)}"
+        )
+
+    return grid, evidence, int(len(overridden))
+
+
 def _apply_temporal_disappearance_overrides(
     current_grid: np.ndarray,
     evidence_by_cell: Dict[Tuple[int, int], str],
@@ -1429,14 +1463,24 @@ def observe_board(
     # assertion as a forbidden transition, let independent old-body-loss
     # evidence invalidate that contaminated color vote. Capacity is not used.
     direct_grid = raw_direct_grid
+    persistent_empty_overrides = 0
     direct_temporal_empty_by_color: Dict[int, int] = {}
     if previous_grid is not None:
         (
             direct_grid,
             evidence,
+            persistent_empty_overrides,
+        ) = _apply_persistent_empty_invariant(
+            direct_grid,
+            evidence,
+            previous_grid,
+        )
+        (
+            direct_grid,
+            evidence,
             direct_temporal_empty_by_color,
         ) = _apply_temporal_disappearance_overrides(
-            raw_direct_grid,
+            direct_grid,
             evidence,
             image_rgb,
             palette,
@@ -1445,6 +1489,12 @@ def observe_board(
             current_grid_rgb,
             previous_grid_rgb,
             previous_frame_rgb,
+        )
+
+    if persistent_empty_overrides:
+        warnings.append(
+            "persistent_empty_direct_color_overrides="
+            f"{persistent_empty_overrides}"
         )
 
     conflicts: List[Tuple[int, int, int, int]] = []

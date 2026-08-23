@@ -89,7 +89,7 @@ def test_color_to_different_color_is_visible_conflict(monkeypatch):
     assert any("forbidden_transition" in reason for reason in observed.health.reasons)
 
 
-def test_empty_to_color_is_visible_conflict(monkeypatch):
+def test_previous_empty_invariant_overrides_direct_sprite_color(monkeypatch):
     direct = _direct_grid(UNKNOWN)
     direct[0, 0] = 1
     previous = _direct_grid(UNKNOWN)
@@ -98,9 +98,46 @@ def test_empty_to_color_is_visible_conflict(monkeypatch):
 
     observed = board.observe_board(_image(), _palette(), previous)
 
-    assert observed.grid[0, 0] == 1
-    assert not observed.health.trusted
-    assert (0, 0, EMPTY, 1) in observed.health.transition_conflicts
+    assert observed.grid[0, 0] == EMPTY
+    assert observed.health.trusted
+    assert observed.health.transition_conflicts == []
+    assert (
+        "empty-invariant-overrides-direct-color"
+        in observed.evidence_by_cell[(0, 0)]
+    )
+    assert any(
+        "persistent_empty_direct_color_overrides=1" in warning
+        for warning in observed.health.warnings
+    )
+
+
+def test_persistent_empty_bounce_does_not_create_capacity_excess(monkeypatch):
+    direct = _direct_grid(UNKNOWN)
+    previous = _direct_grid(UNKNOWN)
+
+    # Already-empty cell with a neighboring sprite painted into it.
+    previous[0, 0] = EMPTY
+    direct[0, 0] = 1
+
+    # The one real C01 removal caused by this action.
+    previous[0, 1] = 1
+    direct[0, 1] = EMPTY
+
+    _patch_current_classifier(monkeypatch, direct)
+
+    observed = board.observe_board(
+        _image(),
+        _palette(),
+        previous,
+        consumed_by_color={1: 1},
+    )
+
+    assert observed.grid[0, 0] == EMPTY
+    assert observed.grid[0, 1] == EMPTY
+    assert observed.visual_removed_by_color == {1: 1}
+    assert observed.health.capacity_remaining_by_color == {}
+    assert observed.health.capacity_excess_by_color == {}
+    assert observed.health.trusted
 
 
 def test_capacity_shortfall_does_not_force_another_cell_empty(monkeypatch):
