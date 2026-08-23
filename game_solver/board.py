@@ -1117,6 +1117,83 @@ def _temporal_old_color_disappeared(
     return bool(strong or very_strong)
 
 
+def _apply_temporal_disappearance_overrides(
+    current_grid: np.ndarray,
+    evidence_by_cell: Dict[Tuple[int, int], str],
+    image_rgb: np.ndarray,
+    palette: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+    previous_grid: np.ndarray,
+    current_grid_rgb: np.ndarray,
+    previous_grid_rgb: Optional[np.ndarray],
+    previous_frame_rgb: Optional[np.ndarray],
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], str], Dict[int, int]]:
+    """
+    Correct direct COLOR false positives caused by neighboring block sprites.
+
+    A removed logical block can leave an EMPTY cell whose pixels are partly
+    covered by the body/feet of an adjacent surviving block. The fresh-frame
+    classifier may then assert either the old color again or a different color.
+    When the previous trusted frame independently proves that the old block body
+    disappeared, that temporal visual evidence is stronger than the contaminated
+    direct color vote and the logical cell is EMPTY.
+
+    Capacity data is deliberately absent here: every coordinate must prove its
+    own disappearance from visual/temporal evidence.
+    """
+    grid = current_grid.copy()
+    evidence = dict(evidence_by_cell)
+    temporal_empty_by_color: Dict[int, int] = defaultdict(int)
+
+    if previous_frame_rgb is None:
+        return grid, evidence, {}
+
+    h, w = image_rgb.shape[:2]
+    candidates = np.argwhere((previous_grid > 0) & (current_grid > 0))
+    for rr, cc in candidates:
+        r, c = int(rr), int(cc)
+        old = int(previous_grid[r, c])
+        direct = int(current_grid[r, c])
+        if old <= 0 or old > len(palette):
+            continue
+
+        cx, cy = _grid_cell_center(r, c, w, h)
+        covered = ui_covered(cx, cy, w, h)
+        temporal = _cell_disappearance_evidence(
+            previous_frame_rgb,
+            image_rgb,
+            current_grid_rgb,
+            previous_grid_rgb,
+            r,
+            c,
+            old,
+            palette,
+            background_rgb,
+        )
+        if not _temporal_old_color_disappeared(
+            temporal,
+            covered_by_fixed_ui=covered,
+        ):
+            continue
+
+        grid[r, c] = EMPTY
+        evidence[(r, c)] = evidence.get((r, c), "") + (
+            "|current-temporal:empty:old-body-loss:"
+            f"old={ctag(old)},direct={ctag(direct)},"
+            f"loss={temporal.loss_ratio:.3f},"
+            f"change={temporal.change_ratio:.3f},"
+            f"stable={temporal.stable_ratio:.3f},"
+            f"zones={temporal.zone_support}"
+        )
+        temporal_empty_by_color[old] += 1
+
+    return (
+        grid,
+        evidence,
+        dict(sorted(temporal_empty_by_color.items())),
+    )
+
+
 def _resolve_unknown_from_history(
     current_grid: np.ndarray,
     evidence_by_cell: Dict[Tuple[int, int], str],
@@ -1341,11 +1418,34 @@ def observe_board(
         reasons.append("current_frame_background_unavailable")
 
     # PRIMARY AUTHORITY: fresh current-frame classification, never prev.copy().
-    direct_grid, evidence = _classify_current_frame_grid(
+    raw_direct_grid, evidence = _classify_current_frame_grid(
         image_rgb,
         palette,
         background_rgb,
     )
+
+    # A stable current frame can still contain pixels from an adjacent block
+    # sprite inside a logically EMPTY cell. Before treating a direct COLOR
+    # assertion as a forbidden transition, let independent old-body-loss
+    # evidence invalidate that contaminated color vote. Capacity is not used.
+    direct_grid = raw_direct_grid
+    direct_temporal_empty_by_color: Dict[int, int] = {}
+    if previous_grid is not None:
+        (
+            direct_grid,
+            evidence,
+            direct_temporal_empty_by_color,
+        ) = _apply_temporal_disappearance_overrides(
+            raw_direct_grid,
+            evidence,
+            image_rgb,
+            palette,
+            background_rgb,
+            previous_grid,
+            current_grid_rgb,
+            previous_grid_rgb,
+            previous_frame_rgb,
+        )
 
     conflicts: List[Tuple[int, int, int, int]] = []
     if previous_grid is not None:
@@ -1359,14 +1459,16 @@ def observe_board(
     final_grid = direct_grid
     history_resolved = 0
     history_by_color: Dict[int, int] = {}
-    temporal_empty_by_color: Dict[int, int] = {}
+    temporal_empty_by_color: Dict[int, int] = dict(
+        direct_temporal_empty_by_color
+    )
     if previous_grid is not None:
         (
             final_grid,
             evidence,
             history_resolved,
             history_by_color,
-            temporal_empty_by_color,
+            resolved_temporal_empty_by_color,
         ) = _resolve_unknown_from_history(
             direct_grid,
             evidence,
@@ -1378,12 +1480,21 @@ def observe_board(
             previous_grid_rgb,
             previous_frame_rgb,
         )
+        for color, count in resolved_temporal_empty_by_color.items():
+            temporal_empty_by_color[color] = (
+                temporal_empty_by_color.get(color, 0) + int(count)
+            )
+        temporal_empty_by_color = dict(sorted(temporal_empty_by_color.items()))
 
     visual_removed = _visual_removals_by_color(previous_grid, final_grid)
 
     direct_empty_by_color: Dict[int, int] = defaultdict(int)
     if previous_grid is not None:
-        for rr, cc in np.argwhere((previous_grid > 0) & (direct_grid == EMPTY)):
+        # Keep this diagnostic strictly "current-frame direct background".
+        # Temporal spill corrections are reported separately.
+        for rr, cc in np.argwhere(
+            (previous_grid > 0) & (raw_direct_grid == EMPTY)
+        ):
             old = int(previous_grid[int(rr), int(cc)])
             direct_empty_by_color[old] += 1
 
