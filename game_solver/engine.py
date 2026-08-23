@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,7 +14,7 @@ from .adb import (
 from .board import (
     ObservedBoard, ctag, learn_palette, observe_board, reachable_summary,
 )
-from .config import FRONT_Y_N, UNKNOWN
+from .config import FRONT_Y_N
 from .display import ClickMark, SolverDisplay
 from .models import AnalysisResult, Candidate, TwoStepPlan
 from .monitor import wait_for_parking_idle
@@ -23,7 +22,13 @@ from .ocr import read_number_at, read_number_detailed_at
 from .state import TrustedSessionState, load_state, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
-    format_report, format_two_step_plan,
+)
+from .debug import (
+    _append_decision_log, _append_execution_update, _append_observation_table_logs,
+    _append_session_marker, _format_observed_board_observation,
+    _format_palette_diagnostics, _resolve_color_log_path,
+    _resolve_decision_log_path, _resolve_number_log_path, format_report,
+    format_two_step_plan,
 )
 from .unlock import unlock_sixth_slot_at_game_start
 from .vehicles import (
@@ -31,382 +36,6 @@ from .vehicles import (
     detect_front_centers, detect_parked, extend_palette_from_front_numbers,
     parking_roi, read_front_numbers_at_centers,
 )
-
-
-
-def _resolve_decision_log_path(args: argparse.Namespace) -> Path:
-    path = getattr(args, "decision_log", None)
-    if path is not None:
-        return Path(path)
-    return args.shots_dir / "decision_log.txt"
-
-
-def _resolve_color_log_path(args: argparse.Namespace) -> Path:
-    path = getattr(args, "color_log", None)
-    if path is not None:
-        return Path(path)
-    return args.shots_dir / "color_log.txt"
-
-
-def _resolve_number_log_path(args: argparse.Namespace) -> Path:
-    path = getattr(args, "number_log", None)
-    if path is not None:
-        return Path(path)
-    return args.shots_dir / "number_log.txt"
-
-
-def _diagnostic_color_tag(color: Optional[int]) -> str:
-    if color is None:
-        return "UNKNOWN"
-    value = int(color)
-    if value <= 0:
-        return "UNKNOWN"
-    return ctag(value)
-
-
-def _diagnostic_number(value: Optional[int]) -> str:
-    return "UNKNOWN" if value is None else str(int(value))
-
-
-def _palette_rgb_hex(rgb: np.ndarray) -> Tuple[int, int, int, str]:
-    vals = tuple(
-        int(round(max(0.0, min(255.0, float(v)))))
-        for v in np.asarray(rgb).reshape(-1)[:3]
-    )
-    if len(vals) != 3:
-        return 0, 0, 0, "#000000"
-    r, g, b = vals
-    return r, g, b, f"#{r:02X}{g:02X}{b:02X}"
-
-
-def _append_color_observation_log(
-    log_path: Path,
-    *,
-    screenshot: Path,
-    result: AnalysisResult,
-    step_label: str,
-) -> None:
-    """
-    每次最终稳定识别后记录一份纯识别色彩快照。
-
-    内容：
-      - 当前动态 palette：C01..Cx -> RGB / HEX；
-      - 当前持久棋盘的 52x38 颜色矩阵；
-      - 每种颜色在棋盘中的格数；
-      - 排队区第一排 / 第二排颜色；
-      - 停车区颜色（按检测到的 x 坐标从左到右编号）。
-
-    只读取 AnalysisResult，不重复执行颜色识别，不影响决策流程。
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-
-    palette = np.asarray(result.palette, dtype=np.float32)
-    grid = np.asarray(result.grid)
-
-    health = result.observation_health
-    lines = [
-        "",
-        "=" * 120,
-        f"[COLOR_SNAPSHOT] time={timestamp}",
-        f"step={step_label}",
-        f"turn={result.turn}",
-        f"screenshot={screenshot.name}",
-        f"screenshot_path={screenshot}",
-        f"grid_rows={grid.shape[0]} grid_cols={grid.shape[1]}",
-        f"palette_count={len(palette)}",
-        f"observation_trusted={'yes' if health.trusted else 'no'}",
-        f"observation_reasons={'; '.join(health.reasons) or 'none'}",
-        "-" * 120,
-        "[PALETTE]",
-        "color | RGB             | HEX     | board_cells",
-        "------|-----------------|---------|------------",
-    ]
-
-    for idx, rgb in enumerate(palette, 1):
-        r, g, b, hex_color = _palette_rgb_hex(rgb)
-        board_cells = int(np.count_nonzero(grid == idx))
-        lines.append(
-            f"{ctag(idx):<5} | ({r:3d},{g:3d},{b:3d}) | "
-            f"{hex_color:<7} | {board_cells}"
-        )
-
-    lines.extend([
-        "",
-        "[BOARD_COLOR_COUNTS]",
-        f"EMPTY={int(np.count_nonzero(grid == 0))}",
-        f"UNKNOWN={int(np.count_nonzero(grid == UNKNOWN))}",
-    ])
-    for idx in range(1, len(palette) + 1):
-        lines.append(f"{ctag(idx)}={int(np.count_nonzero(grid == idx))}")
-
-    front_by_col = {
-        int(car.column): car
-        for car in result.front
-        if car.column is not None
-    }
-    next_by_col = {
-        int(car.column): car
-        for car in result.nxt
-        if car.column is not None
-    }
-    queue_columns = sorted(set(front_by_col) | set(next_by_col))
-
-    lines.extend([
-        "",
-        "[QUEUE_COLORS]",
-        "column | front_color | next_color",
-        "-------|-------------|-----------",
-    ])
-    if queue_columns:
-        for column in queue_columns:
-            front_car = front_by_col.get(column)
-            next_car = next_by_col.get(column)
-            lines.append(
-                f"{column:>6d} | "
-                f"{_diagnostic_color_tag(front_car.color if front_car else None):<11} | "
-                f"{_diagnostic_color_tag(next_car.color if next_car else None)}"
-            )
-    else:
-        lines.append("(empty)")
-
-    parked = sorted(result.parked, key=lambda car: float(car.x))
-    lines.extend([
-        "",
-        "[PARKING_COLORS]",
-        "order_left_to_right | x_px    | color",
-        "--------------------|---------|--------",
-    ])
-    if parked:
-        for order, car in enumerate(parked, 1):
-            lines.append(
-                f"{order:>19d} | {float(car.x):>7.1f} | "
-                f"{_diagnostic_color_tag(car.color)}"
-            )
-    else:
-        lines.append("(empty)")
-
-    lines.extend([
-        "",
-        "[BOARD_GRID]",
-        "legend: ----=EMPTY, ????=UNKNOWN, C01..Cx=recognized color",
-    ])
-
-    if grid.ndim == 2:
-        cols = int(grid.shape[1])
-        header = "row\\col | " + " ".join(
-            f"{c + 1:>4d}" for c in range(cols)
-        )
-        lines.append(header)
-        lines.append("-" * len(header))
-
-        for r in range(int(grid.shape[0])):
-            values = []
-            for c in range(cols):
-                value = int(grid[r, c])
-                if value == 0:
-                    tag = "----"
-                elif value == UNKNOWN or value < 0:
-                    tag = "????"
-                else:
-                    tag = ctag(value)
-                values.append(f"{tag:>4}")
-            lines.append(f"R{r + 1:02d}     | " + " ".join(values))
-    else:
-        lines.append(f"(unexpected grid shape: {grid.shape})")
-
-    lines.append("=" * 120)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def _append_number_observation_log(
-    log_path: Path,
-    *,
-    screenshot: Path,
-    result: AnalysisResult,
-    step_label: str,
-) -> None:
-    """
-    每次最终稳定识别后记录排队区和停车区数字。
-
-    颜色只作为交叉定位列；数字字段完全来自当前 AnalysisResult，
-    不在日志阶段再次执行 OCR。
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-
-    front_by_col = {
-        int(car.column): car
-        for car in result.front
-        if car.column is not None
-    }
-    next_by_col = {
-        int(car.column): car
-        for car in result.nxt
-        if car.column is not None
-    }
-    queue_columns = sorted(set(front_by_col) | set(next_by_col))
-
-    health = result.observation_health
-    lines = [
-        "",
-        "=" * 104,
-        f"[NUMBER_SNAPSHOT] time={timestamp}",
-        f"step={step_label}",
-        f"turn={result.turn}",
-        f"screenshot={screenshot.name}",
-        f"screenshot_path={screenshot}",
-        f"observation_trusted={'yes' if health.trusted else 'no'}",
-        f"observation_reasons={'; '.join(health.reasons) or 'none'}",
-        "-" * 104,
-        "[QUEUE_NUMBERS]",
-        "column | front_color | front_number | next_color | next_number",
-        "-------|-------------|--------------|------------|------------",
-    ]
-
-    if queue_columns:
-        for column in queue_columns:
-            front_car = front_by_col.get(column)
-            next_car = next_by_col.get(column)
-            lines.append(
-                f"{column:>6d} | "
-                f"{_diagnostic_color_tag(front_car.color if front_car else None):<11} | "
-                f"{_diagnostic_number(front_car.remain if front_car else None):<12} | "
-                f"{_diagnostic_color_tag(next_car.color if next_car else None):<10} | "
-                f"{_diagnostic_number(next_car.remain if next_car else None)}"
-            )
-    else:
-        lines.append("(empty)")
-
-    parked = sorted(result.parked, key=lambda car: float(car.x))
-    lines.extend([
-        "",
-        "[PARKING_NUMBERS]",
-        "order_left_to_right | x_px    | color   | remain_number",
-        "--------------------|---------|---------|--------------",
-    ])
-    if parked:
-        for order, car in enumerate(parked, 1):
-            lines.append(
-                f"{order:>19d} | {float(car.x):>7.1f} | "
-                f"{_diagnostic_color_tag(car.color):<7} | "
-                f"{_diagnostic_number(car.remain)}"
-            )
-    else:
-        lines.append("(empty)")
-
-    lines.extend([
-        "",
-        "[SUMMARY]",
-        f"front_detected={len(result.front)}",
-        f"next_detected={len(result.nxt)}",
-        f"parked_detected={len(result.parked)}",
-        f"occupied_slots={result.occupied_slots}",
-        "=" * 104,
-    ])
-
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def _append_observation_table_logs(
-    color_log_path: Path,
-    number_log_path: Path,
-    *,
-    screenshot: Path,
-    result: AnalysisResult,
-    step_label: str,
-) -> None:
-    """Write diagnosis-only tables for the selected stable observation."""
-    _append_color_observation_log(
-        color_log_path,
-        screenshot=screenshot,
-        result=result,
-        step_label=step_label,
-    )
-    _append_number_observation_log(
-        number_log_path,
-        screenshot=screenshot,
-        result=result,
-        step_label=step_label,
-    )
-
-
-def _append_decision_log(
-    log_path: Path,
-    *,
-    screenshot: Path,
-    result: AnalysisResult,
-    step_label: str,
-    execution: Optional[str] = None,
-) -> None:
-    """
-    追加一条可追踪的决策记录。
-
-    每一步都绑定：
-      - 分析截图文件名/路径
-      - 当前 turn / step
-      - 完整候选与策略依据（result.report）
-      - 最终计划
-      - 可选的实际执行结果
-
-    使用 append 而不是覆盖，便于同一日志连续追踪多局；每个自动运行会写 SESSION
-    分隔，--reset 时额外标记 NEW GAME。
-    """
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    lines = [
-        "",
-        "=" * 88,
-        f"[DECISION] time={timestamp}",
-        f"step={step_label}",
-        f"turn={result.turn}",
-        f"screenshot={screenshot.name}",
-        f"screenshot_path={screenshot}",
-        f"parking={result.occupied_slots}",
-        "-" * 88,
-        result.report,
-    ]
-    if execution:
-        lines.extend([
-            "-" * 88,
-            f"execution={execution}",
-        ])
-    lines.append("=" * 88)
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-
-
-def _append_execution_update(
-    log_path: Path,
-    *,
-    screenshot: Path,
-    step_label: str,
-    execution: str,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(
-            f"[EXECUTION] time={timestamp} step={step_label} "
-            f"screenshot={screenshot.name} {execution}\n"
-        )
-
-
-def _append_session_marker(
-    log_path: Path,
-    *,
-    reset: bool,
-) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write("\n" + "#" * 88 + "\n")
-        f.write(f"[SESSION] start={timestamp}\n")
-        if reset:
-            f.write("[NEW GAME] --reset 已启用，本次从新局状态开始\n")
-        f.write("#" * 88 + "\n")
 
 
 
@@ -448,29 +77,6 @@ def _stable_state_conflicts(
                 tuple(sorted(remains)),
             )
     return conflicts
-
-
-def _format_palette_diagnostics(palette: np.ndarray) -> str:
-    """
-    记录最接近的 palette 色对，后续可直接追踪“相近色是否被错误合并”。
-
-    这里只做诊断，不擅自改变分类阈值。
-    """
-    if palette is None or len(palette) < 2:
-        return ""
-
-    pairs = []
-    for i in range(len(palette)):
-        for j in range(i + 1, len(palette)):
-            dist = float(np.linalg.norm(palette[i] - palette[j]))
-            pairs.append((dist, i + 1, j + 1))
-
-    pairs.sort()
-    nearest = pairs[: min(6, len(pairs))]
-    return "；".join(
-        f"{ctag(a)}-{ctag(b)} RGB距离={dist:.1f}"
-        for dist, a, b in nearest
-    )
 
 
 def _parking_remaining_by_color(parked) -> Dict[int, int]:
@@ -551,55 +157,6 @@ def _actual_consumed_from_capacity_delta(
         )
 
     return consumed, ""
-
-
-def _format_observed_board_observation(observation: ObservedBoard) -> str:
-    health = observation.health
-    lines = [
-        "[OBSERVED_BOARD]",
-        "  spatial authority: current stable frame first; history resolves current UNKNOWN only",
-        (
-            f"  cells: COLOR={observation.current_color_cells}, "
-            f"EMPTY={observation.current_empty_cells}, "
-            f"UNKNOWN={observation.current_unknown_cells}"
-        ),
-        (
-            f"  history_resolved={observation.history_resolved_cells}, "
-            f"temporal_empty={observation.temporal_resolved_empty_cells}, "
-            f"visual_removed={observation.removed_cells}"
-        ),
-        f"  trusted={'yes' if health.trusted else 'no'}",
-    ]
-    if health.reasons:
-        lines.append("  reasons: " + "；".join(health.reasons))
-    if health.warnings:
-        lines.append("  warnings: " + "；".join(health.warnings))
-    if observation.capacity_expected_by_color:
-        lines.append(
-            "  capacity audit expected: "
-            + ", ".join(
-                f"{ctag(c)}={n}"
-                for c, n in observation.capacity_expected_by_color.items()
-            )
-        )
-    if observation.visual_removed_by_color:
-        lines.append(
-            "  visual removals: "
-            + ", ".join(
-                f"{ctag(c)}={n}"
-                for c, n in observation.visual_removed_by_color.items()
-            )
-        )
-    if health.transition_conflicts:
-        lines.append(
-            "  forbidden transitions: "
-            + ", ".join(
-                f"R{r + 1:02d}C{c + 1:02d}:"
-                f"{ctag(old) if old > 0 else 'EMPTY'}->{ctag(cur)}"
-                for r, c, old, cur in health.transition_conflicts
-            )
-        )
-    return "\n".join(lines)
 
 
 def _observed_board_allows_planning(
@@ -1327,6 +884,54 @@ def _observation_trust(
     return bool(health.trusted), reasons
 
 
+
+def _capture_analysis_frame(
+    args: argparse.Namespace,
+    display: SolverDisplay,
+    *,
+    round_no: int,
+    observation_attempt: int,
+    max_observation_attempts: int,
+) -> Tuple[Path, Optional[np.ndarray]]:
+    """PHASE 1: capture one stable-analysis frame and update optional display."""
+    if observation_attempt == 1:
+        shot = args.shots_dir / f"analysis_{shot_stamp()}.png"
+    else:
+        shot = (
+            args.shots_dir
+            / f"analysis_retry{observation_attempt}_{shot_stamp()}.png"
+        )
+
+    adb_screencap(shot, args.serial)
+    print(
+        f"分析截图: {shot}"
+        + (
+            ""
+            if observation_attempt == 1
+            else f"（观测重试 {observation_attempt}/{max_observation_attempts}）"
+        )
+    )
+
+    analysis_bgr = cv2.imread(str(shot), cv2.IMREAD_COLOR)
+    if analysis_bgr is not None:
+        display.show(
+            analysis_bgr,
+            stage=(
+                f"自动轮次 {round_no} · 正在分析"
+                if observation_attempt == 1
+                else (
+                    f"自动轮次 {round_no} · RETRY_OBSERVATION "
+                    f"{observation_attempt}/{max_observation_attempts}"
+                )
+            ),
+            hint=(
+                "正在识别棋盘、队列与停车车辆。"
+                if observation_attempt == 1
+                else "上一张 ObservationHealth 不可信；重新截图确认，不点击。"
+            ),
+        )
+    return shot, analysis_bgr
+
 def run_auto_flow_mode(args: argparse.Namespace) -> int:
     display = SolverDisplay(
         enabled=not args.no_display,
@@ -1421,42 +1026,25 @@ def _run_auto_flow_mode_impl(
         best_observation_bgr: Optional[np.ndarray] = None
 
         for observation_attempt in range(1, max_observation_attempts + 1):
-            if observation_attempt == 1:
-                shot = args.shots_dir / f"analysis_{shot_stamp()}.png"
-            else:
-                shot = (
-                    args.shots_dir
-                    / f"analysis_retry{observation_attempt}_{shot_stamp()}.png"
-                )
 
-            adb_screencap(shot, args.serial)
-            print(
-                f"分析截图: {shot}"
-                + (
-                    ""
-                    if observation_attempt == 1
-                    else f"（观测重试 {observation_attempt}/{max_observation_attempts}）"
-                )
+            # PHASE 1 — stable capture
+
+            shot, analysis_bgr = _capture_analysis_frame(
+
+                args,
+
+                display,
+
+                round_no=round_no,
+
+                observation_attempt=observation_attempt,
+
+                max_observation_attempts=max_observation_attempts,
+
             )
 
-            analysis_bgr = cv2.imread(str(shot), cv2.IMREAD_COLOR)
-            if analysis_bgr is not None:
-                display.show(
-                    analysis_bgr,
-                    stage=(
-                        f"自动轮次 {round_no} · 正在分析"
-                        if observation_attempt == 1
-                        else (
-                            f"自动轮次 {round_no} · RETRY_OBSERVATION "
-                            f"{observation_attempt}/{max_observation_attempts}"
-                        )
-                    ),
-                    hint=(
-                        "正在识别棋盘、队列与停车车辆。"
-                        if observation_attempt == 1
-                        else "上一张 ObservationHealth 不可信；重新截图确认，不点击。"
-                    ),
-                )
+
+            # PHASE 2 — perception + deterministic planning on this observation
 
             result = analyze_image(
                 shot,
@@ -1517,6 +1105,7 @@ def _run_auto_flow_mode_impl(
         shot = best_observation_shot
         analysis_bgr = best_observation_bgr
 
+        # PHASE 3 — validation / strict trust gate
         observation_trusted, untrusted_reasons = _observation_trust(result)
         untrusted_reason_text = "; ".join(untrusted_reasons) or "none"
 
@@ -1575,6 +1164,7 @@ def _run_auto_flow_mode_impl(
                 "且本轮只允许单步候选。"
             )
 
+        # PHASE 4 — trusted context commit (pre-action checkpoint semantics preserved)
         # Trusted observation, or one explicit experimental opt-in, advances context.
         _commit_analysis_result_state(args.state, result)
         if analysis_bgr is not None:
@@ -1743,6 +1333,7 @@ def _run_auto_flow_mode_impl(
             )
             continue
 
+        # PHASE 5 — execute the selected stable-safe action(s)
         if args.tap_delay > 0:
             time.sleep(args.tap_delay)
 
@@ -2045,6 +1636,7 @@ def _run_auto_flow_mode_impl(
                 ),
             )
 
+        # PHASE 6 — wait for parking absorption/animation to become stable
         monitor_end = wait_for_parking_idle(
             shots_dir=args.shots_dir,
             serial=args.serial,
