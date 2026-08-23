@@ -34,21 +34,23 @@ class Candidate:
     unlocked_by_color: Dict[int, int]
     rejected: bool
     reject_reason: str
-    score: float
+
+    # Issue 007: rule-first deterministic ordering. Leading terms are:
+    # parked releases, all guaranteed completions, deterministic cleared cells,
+    # useful deterministic exposure, queue progress. Remaining terms are a
+    # small bounded tie-break only.
+    utility: Tuple[int, ...]
+    utility_reason: str
+    queue_progress: int
+    heuristic_tiebreak: Tuple[int, ...]
+
     next_color: Optional[int]
     next_capacity: Optional[int]
-    queue_unlock_bonus: float
-    next_vehicle_score: float
-    next_vehicle_chain_parked_completions: int
-    next_vehicle_exact: bool
-    next_match_contacts: int
-    neighbor_contacts: Dict[int, int]
 
-    # v5.3：自动分流闭包的稳定状态摘要。
+    # Deterministic flow-closure diagnostics retained for execution/reporting.
     flow_cleared_cells: int = 0
     flow_final_occupied_upper: int = 0
     flow_exact: bool = True
-    flow_rounds: int = 0
 
 
 @dataclass
@@ -56,15 +58,16 @@ class TwoStepPlan:
     first: Candidate
     second: Candidate
     second_source: str          # front / next
-    score: float
+    utility: Tuple[int, ...]
+    utility_reason: str
     free_slots_before: int
-    first_simulated_exactly: bool
     reason: str
-
-    # v5.3：A+B 作为联合动作模拟后的稳定状态。
     guaranteed_completions: int = 0
     guaranteed_parked_completions: int = 0
     cleared_cells: int = 0
+    useful_exposed_cells: int = 0
+    queue_progress: int = 2
+    heuristic_tiebreak: Tuple[int, ...] = ()
     final_occupied_upper: int = 0
     flow_exact: bool = True
 

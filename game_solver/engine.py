@@ -1912,7 +1912,7 @@ def _run_auto_flow_mode_impl(
             if second_executed:
                 predicted_occupied_upper = plan.final_occupied_upper
                 predicted_basis = (
-                    f"two-step score={plan.score:.1f}, "
+                    f"two-step utility={plan.utility}, "
                     f"flow_final_occupied_upper={plan.final_occupied_upper}, "
                     f"guaranteed_completions={plan.guaranteed_completions}"
                 )
