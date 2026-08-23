@@ -12,13 +12,13 @@ from .engine import analyze_image, run_auto_flow_mode, run_manual_step_mode
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "游戏截图滚动求解器：稳定观测 + retry 只读提交 + "
-            "默认严格 no-click gate"
+            "游戏截图求解器：当前稳定帧观测 → ObservationHealth 严格校验 → "
+            "trusted-only 规划与执行"
         )
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--adb", action="store_true", help="使用 ADB")
-    src.add_argument("--image", type=Path, help="分析一张本地截图")
+    src.add_argument("--image", type=Path, help="分析一张本地稳定截图；不执行 ADB 点击")
 
     parser.add_argument(
         "--serial",
@@ -42,7 +42,7 @@ def main() -> int:
         default=None,
         help=(
             "逐步决策日志文件；默认写入 <shots-dir>/decision_log.txt。"
-            "每一步记录分析截图名、完整候选评分、最终策略与实际执行结果。"
+            "每一步记录分析截图名、完整候选 utility、最终策略与实际执行结果。"
         ),
     )
     parser.add_argument(
@@ -72,7 +72,7 @@ def main() -> int:
     parser.add_argument(
         "--reset",
         action="store_true",
-        help="新局重建动态颜色、棋盘与空停车区参考",
+        help="新局或 state schema 不兼容时重建 palette、trusted context 与空停车区参考",
     )
     parser.add_argument(
         "--no-auto-tap",
@@ -169,8 +169,8 @@ def main() -> int:
         "--experimental-continue",
         action="store_true",
         help=(
-            "显式允许自动模式在 bounded retry 后仍对 ObservationHealth 不可信的"
-            "观测提交当前保守状态，并仅生成单步候选继续诊断；默认关闭。"
+            "诊断开关：bounded retry 后仍不可信时，可显式提交当前保守 observation，"
+            "但只生成单步候选；默认关闭，正常自动求解不会绕过 trusted-only gate。"
         ),
     )
     parser.add_argument(
@@ -208,13 +208,6 @@ def main() -> int:
         help="广告关闭返回游戏后再等待多久开始分析，默认 1 秒",
     )
 
-    # 兼容旧版本命令行；纯数字监控模式下该参数不再使用。
-    parser.add_argument(
-        "--transition-timeout",
-        type=float,
-        default=None,
-        help=argparse.SUPPRESS,
-    )
     args = parser.parse_args()
 
     if args.slots < 1:

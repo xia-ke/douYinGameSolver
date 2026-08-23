@@ -225,7 +225,7 @@ def analyze_image(
     """
     Analyze one stable screenshot.
 
-    Issue 006 trust policy:
+    trust policy:
       - ObservationHealth describes this frame only;
       - trusted -> normal planner;
       - untrusted -> no planner/no click by default;
@@ -1313,7 +1313,7 @@ def _run_auto_flow_mode_impl(
             return 2
 
         if result.best is None:
-            # v5.12: best_valid_candidate 同时承担稳定停车 hard veto。
+            # best_valid_candidate 同时承担稳定停车 hard veto。
             # 没有安全候选时必须保持不点击，而不是为了实验继续送车入场。
             _append_execution_update(
                 log_path,
@@ -1347,7 +1347,7 @@ def _run_auto_flow_mode_impl(
             f"flow_final_occupied_upper={result.best.flow_final_occupied_upper}"
         )
 
-        # v5.3：双步最坏两辆都留下时只要求不超过 6，因此空位>=2 即可。
+        # 双步最坏两辆都留下时只要求不超过 6，因此空位>=2 即可。
         if plan is not None and (args.slots - result.occupied_slots) >= 2:
             first_car = next(
                 c for c in result.front
@@ -1453,7 +1453,7 @@ def _run_auto_flow_mode_impl(
                         result,
                         plan.first,
                     ):
-                        # v5.12 click confirmation: ADB tap was sent but the old
+                        # click confirmation: ADB tap was sent but the old
                         # first-row car is still there. Do not invent capacity.
                         if executed_actions and executed_actions[-1] == (
                             int(plan.first.color),
@@ -1547,7 +1547,7 @@ def _run_auto_flow_mode_impl(
                 f"{ctag(result.best.color)}x{result.best.capacity} "
                 f"xy=({x},{y})"
             )
-            # v5.12 click confirmation: when the same column has a
+            # click confirmation: when the same column has a
             # distinguishable known next car, briefly confirm that the original car
             # did not simply remain after a missed ADB tap.
             single_confirm_failed = False
@@ -1655,7 +1655,7 @@ def _run_auto_flow_mode_impl(
             execution=f"monitor_end={Path(monitor_end).name if monitor_end else monitor_end}",
         )
 
-        # v5.11 primary completion path: if the pre-click analysis proved that
+        # primary completion path: if the pre-click analysis proved that
         # this click batch consumes every remaining queue entry, the confirmed
         # game rule says the level is complete after this batch's parking flow
         # stabilizes. Do not require post-click queue OCR.

@@ -87,16 +87,16 @@ def load_state(path: Path) -> TrustedSessionState:
     """
     Load the canonical previous-trusted-context schema.
 
-    State v3 and earlier are deliberately not migrated internally. Their field
-    name ``grid`` encouraged treating persisted history as current authority;
-    use ``--reset`` once after this cutover instead of retaining dual readers.
+    Only the current previous-trusted-context schema is accepted. State files
+    with any other version are intentionally not dual-read or migrated in-process;
+    use ``--reset`` in a new game to rebuild the trusted context.
     """
     with np.load(path) as data:
         version = int(data["version"][0]) if "version" in data else 0
         if version != STATE_VERSION:
             raise RuntimeError(
-                f"状态文件版本 {version} 与当前程序版本 {STATE_VERSION} 不兼容。"
-                "Issue 004 已切换到 previous trusted context 状态格式；"
+                f"状态文件版本 {version} 与当前 state schema {STATE_VERSION} 不兼容。"
+                "当前只支持 previous-trusted-context 状态格式；"
                 "请在新局使用 --reset 重建 solver_state.npz。"
             )
 

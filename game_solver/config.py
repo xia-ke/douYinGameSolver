@@ -95,7 +95,7 @@ RAW_MONITOR_MAX_ASPECT = 1.30
 RAW_MONITOR_MASK_CHANGE_RATIO = 0.08
 RAW_MONITOR_EMPTY_CONFIRM_EXTRA_FRAMES = 2
 
-# Issue 004: canonical previous-trusted-context schema; old state requires --reset.
+# canonical previous-trusted-context schema; old state requires --reset.
 STATE_VERSION = 4
 
 UNKNOWN = -1
@@ -131,7 +131,7 @@ UNLOCK_AD_CLOSE_RETRY_COUNT = 8
 UNLOCK_GAME_FRONT_MIN_COLUMNS = 3
 UNLOCK_GAME_FRONT_MIN_SPAN_N = 0.35
 
-# v5.19: 3列关卡的第一排横向跨度天然小于4/5列。
+# 3列关卡的第一排横向跨度天然小于4/5列。
 # 关卡16实测三列中心约 x=316,471,624，span_n≈0.328，
 # 原统一 0.35 阈值会把正常游戏界面误判为广告/其它界面。
 # 三列时单独放宽跨度，同时要求相邻列间距近似规则。

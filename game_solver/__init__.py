@@ -1,1 +1,1 @@
-__version__ = "5.1-dynamic-queue"
+"""Mission-first game solver package."""

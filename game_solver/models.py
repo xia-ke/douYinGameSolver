@@ -35,7 +35,7 @@ class Candidate:
     rejected: bool
     reject_reason: str
 
-    # Issue 007: rule-first deterministic ordering. Leading terms are:
+    # rule-first deterministic ordering. Leading terms are:
     # parked releases, all guaranteed completions, deterministic cleared cells,
     # useful deterministic exposure, queue progress. Remaining terms are a
     # small bounded tie-break only.
@@ -118,7 +118,7 @@ class AnalysisResult:
     front_ocr_reads: int
     two_step_plan: Optional[TwoStepPlan]
 
-    # Issue 006: the sole execution trust signal for this current observation.
+    # the sole execution trust signal for this current observation.
     observation_health: ObservationHealth
 
     state_saved: bool = True

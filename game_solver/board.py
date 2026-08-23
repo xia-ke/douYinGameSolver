@@ -29,7 +29,7 @@ _HISTORY_COLOR_FALLBACK_DIST = 44.0
 # Fixed top UI is a confidence penalty for current-frame color confirmation.
 _UI_VISIBLE_CENTER_DIST = 30.0
 
-# v5.14: perception-first board recognition.
+# perception-first board recognition.
 #
 # A logical cell is ~21x18 px at the reference resolution.  Center 2x2 RGB
 # is too fragile when a disappearing block is covered by a car body / foot /
@@ -67,7 +67,7 @@ _RECOG_VERY_STRONG_CHANGE_RATIO = 0.62
 _RECOG_VERY_STRONG_STABLE_MAX = 0.22
 _RECOG_VERY_STRONG_CURR_COVERAGE_MAX = 0.24
 
-# v5.16: visual truth is authoritative for spatial state.
+# visual truth is authoritative for spatial state.
 #
 # Background is a real visual class.  Do NOT reject a true gray background
 # merely because it happens to be numerically close to one palette center.
@@ -917,7 +917,7 @@ def _looks_like_empty_background(
 
 
 # ---------------------------------------------------------------------------
-# Issue 003: current-stable-frame board observation authority
+# current-stable-frame board observation authority
 # ---------------------------------------------------------------------------
 
 def _background_zone_support(background_mask: np.ndarray) -> int:
