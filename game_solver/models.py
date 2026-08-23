@@ -71,7 +71,7 @@ class TwoStepPlan:
 
 @dataclass
 class ObservationHealth:
-    """Structured trust result for one current stable-frame board observation."""
+    """Current stable-frame trust result. No multi-round recovery state lives here."""
 
     trusted: bool
     reasons: List[str] = field(default_factory=list)
@@ -80,6 +80,21 @@ class ObservationHealth:
     transition_conflicts: List[Tuple[int, int, int, int]] = field(default_factory=list)
     capacity_remaining_by_color: Dict[int, int] = field(default_factory=dict)
     capacity_excess_by_color: Dict[int, int] = field(default_factory=dict)
+
+    def add_reason(self, reason: str) -> None:
+        """Mark this observation untrusted for one explicit current-frame reason."""
+        value = str(reason).strip()
+        if not value:
+            return
+        if value not in self.reasons:
+            self.reasons.append(value)
+        self.trusted = False
+
+    def add_warning(self, warning: str) -> None:
+        """Attach diagnostic context without changing current-frame trust."""
+        value = str(warning).strip()
+        if value and value not in self.warnings:
+            self.warnings.append(value)
 
 
 @dataclass
@@ -100,22 +115,11 @@ class AnalysisResult:
     front_ocr_reads: int
     two_step_plan: Optional[TwoStepPlan]
 
-    # Issue 004: legacy-shaped status fields remain only as runtime/gate
-    # compatibility and are scheduled for removal in Issue 006. Spatial
-    # authority is ObservationHealth/ObservedBoard only.
-    board_update_status: str = "ok"  # ok / incomplete / causal_invalid
-    board_update_remaining_by_color: Dict[int, int] = field(default_factory=dict)
-    board_update_excess_by_color: Dict[int, int] = field(default_factory=dict)
-    causal_input_invalid: str = ""
-    model_conflict_colors: List[int] = field(default_factory=list)
-    strategy_untrusted_colors: List[int] = field(default_factory=list)
-    guarantee_broken: bool = False
-    guarantee_expected_upper: Optional[int] = None
+    # Issue 006: the sole execution trust signal for this current observation.
+    observation_health: ObservationHealth
+
     state_saved: bool = True
 
-    # Issue 003: current-frame board authority and structured trust diagnostics.
-    observation_health: Optional[ObservationHealth] = None
-
-    # v5.9：当前稳定截图的 52x38x3 格子 RGB 快照。
-    # 自动重试结束后只在最终 commit 时写入 solver_state。
+    # Current stable screenshot's 52x38x3 cell RGB snapshot. Retry attempts are
+    # read-only; only the selected committed observation becomes history.
     grid_rgb_snapshot: Optional[np.ndarray] = None

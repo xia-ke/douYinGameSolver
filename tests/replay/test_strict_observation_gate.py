@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from game_solver import engine
+from game_solver.models import ObservationHealth
 
 
 class _FakeDisplay:
@@ -22,7 +23,7 @@ class _TapObserved(RuntimeError):
     pass
 
 
-def _analysis(*, status: str, causal_invalid: str = "") -> SimpleNamespace:
+def _analysis(*, trusted: bool, reason: str = "") -> SimpleNamespace:
     car = SimpleNamespace(column=1, color=1, remain=3, x=120.0, y=1800.0)
     candidate = SimpleNamespace(
         column=1,
@@ -30,17 +31,16 @@ def _analysis(*, status: str, causal_invalid: str = "") -> SimpleNamespace:
         capacity=3,
         flow_final_occupied_upper=1,
     )
+    reasons = [reason] if reason else ([] if trusted else ["test_untrusted"])
     return SimpleNamespace(
-        board_update_status=status,
-        causal_input_invalid=causal_invalid,
-        board_update_remaining_by_color={1: 1} if status == "incomplete" else {},
-        board_update_excess_by_color={},
+        observation_health=ObservationHealth(
+            trusted=trusted,
+            reasons=reasons,
+            unknown_cells=0,
+        ),
         grid=np.ones((2, 2), dtype=np.int16),
         report="diagnostic observation",
-        front_number_cache={1: object()},
         front_ocr_reads=1,
-        guarantee_broken=False,
-        model_conflict_colors=set(),
         front=[car],
         nxt=[],
         occupied_slots=0,
@@ -72,7 +72,6 @@ def _args(tmp_path: Path, *, experimental_continue: bool) -> SimpleNamespace:
         parking_idle_timeout=1.0,
         observation_retries=1,
         observation_retry_delay=0.01,
-        safe_pause_retry_delay=0.01,
         experimental_continue=experimental_continue,
         no_auto_tap=False,
         tap_delay=0.0,
@@ -114,17 +113,17 @@ def _patch_auto_dependencies(monkeypatch, result, execution_log, commits, taps):
 
 
 @pytest.mark.parametrize(
-    ("status", "causal_invalid"),
+    "reason",
     [
-        ("incomplete", ""),
-        ("causal_invalid", "capacity conservation invalid"),
-        ("ok", "capacity conservation invalid"),
+        "forbidden_transition R01C01:C01->C02",
+        "capacity_conservation_invalid: test",
+        "parking_ocr_incomplete=1/2",
     ],
 )
 def test_strict_default_rejects_untrusted_without_commit_or_tap(
-    tmp_path, monkeypatch, status, causal_invalid
+    tmp_path, monkeypatch, reason
 ):
-    result = _analysis(status=status, causal_invalid=causal_invalid)
+    result = _analysis(trusted=False, reason=reason)
     args = _args(tmp_path, experimental_continue=False)
     execution_log = []
     commits = []
@@ -148,7 +147,7 @@ def test_strict_default_rejects_untrusted_without_commit_or_tap(
 
 
 def test_experimental_continue_is_explicit_opt_in(tmp_path, monkeypatch):
-    result = _analysis(status="incomplete")
+    result = _analysis(trusted=False, reason="test_untrusted")
     args = _args(tmp_path, experimental_continue=True)
     execution_log = []
     commits = []

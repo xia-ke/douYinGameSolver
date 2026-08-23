@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
 from datetime import datetime
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,129 +32,6 @@ from .vehicles import (
     parking_roi, read_front_numbers_at_centers,
 )
 
-
-# ---------------------------------------------------------------------------
-# v5.6 运行时安全状态机
-# ---------------------------------------------------------------------------
-# 目标不是“发现一次异常就退出 Python”，而是：
-#   NORMAL -> RETRY_OBSERVATION -> PAUSED_SYNC / DEGRADED -> PAUSED_SAFE -> HARD_STOP
-#
-# 常态下尽量自动运行；局部模型不可信时隔离对应颜色、关闭多步和停车连锁
-# guarantee；只有持续且无法恢复的高风险状态才真正退出。
-@dataclass
-class _SafetyRuntime:
-    mode: str = "NORMAL"
-    untrusted_colors: Set[int] = field(default_factory=set)
-    clean_streak: int = 0
-    conservative_turns: int = 0
-    board_incomplete_streak: int = 0
-    guarantee_break_rounds: List[int] = field(default_factory=list)
-    pause_reason: str = ""
-
-    @property
-    def force_single_step(self) -> bool:
-        return self.mode != "NORMAL" or self.conservative_turns > 0
-
-    @property
-    def disable_parked_chain(self) -> bool:
-        return self.mode != "NORMAL" or self.conservative_turns > 0
-
-    def degrade(
-        self,
-        *,
-        colors=(),
-        reason: str,
-        turns: int = 3,
-    ) -> None:
-        self.untrusted_colors.update(int(c) for c in colors if int(c) > 0)
-        if self.mode != "PAUSED_SAFE":
-            self.mode = "DEGRADED"
-        self.conservative_turns = max(self.conservative_turns, int(turns))
-        self.clean_streak = 0
-        self.pause_reason = reason
-
-    def pause(self, reason: str) -> None:
-        self.mode = "PAUSED_SAFE"
-        self.pause_reason = reason
-        self.clean_streak = 0
-
-    def pause_sync(self, reason: str) -> None:
-        # 当前动作的棋盘转移尚未完整落盘。此状态严禁产生新点击，
-        # 也不把 unresolved consumption 跨动作累计。
-        self.mode = "PAUSED_SYNC"
-        self.pause_reason = reason
-        self.clean_streak = 0
-        self.board_incomplete_streak += 1
-
-
-    def note_model_conflict(self, colors) -> None:
-        self.degrade(
-            colors=colors,
-            reason="稳定停车车与 reachable 冲突",
-            turns=3,
-        )
-
-    def note_guarantee_broken(self, round_no: int) -> None:
-        self.guarantee_break_rounds.append(int(round_no))
-        self.guarantee_break_rounds = [
-            r for r in self.guarantee_break_rounds
-            if int(round_no) - r < 5
-        ]
-        if len(self.guarantee_break_rounds) >= 2:
-            self.pause(
-                "最近5轮内至少2次 guaranteed parking upper 被真实结果击穿"
-            )
-        else:
-            self.degrade(
-                reason="guaranteed parking upper 被真实结果击穿",
-                turns=3,
-            )
-
-    def note_clean(self) -> None:
-        self.board_incomplete_streak = 0
-        self.clean_streak += 1
-        if self.conservative_turns > 0:
-            self.conservative_turns -= 1
-
-        if self.mode == "PAUSED_SYNC":
-            # 当前转移终于完整同步。先以单步/自完成门槛运行一小段，
-            # 避免刚恢复时立刻重新使用激进多步。
-            self.mode = "DEGRADED"
-            self.conservative_turns = max(self.conservative_turns, 2)
-            self.pause_reason = "棋盘转移已重新同步，暂以保守模式恢复"
-            self.clean_streak = 0
-            return
-
-        if self.mode == "PAUSED_SAFE":
-            # PAUSED_SAFE 不自动跳回 NORMAL。连续两张稳定、无冲突截图后，
-            # 先恢复到 DEGRADED，再观察3轮。
-            if self.clean_streak >= 2:
-                self.mode = "DEGRADED"
-                self.conservative_turns = max(self.conservative_turns, 3)
-                self.pause_reason = "观测连续恢复，先以保守模式继续"
-                self.clean_streak = 0
-            return
-
-        if (
-            self.mode == "DEGRADED"
-            and self.clean_streak >= 3
-            and self.conservative_turns <= 0
-        ):
-            self.mode = "NORMAL"
-            self.untrusted_colors.clear()
-            self.pause_reason = ""
-            self.clean_streak = 0
-
-    def status_line(self) -> str:
-        colors = ",".join(
-            ctag(c) for c in sorted(self.untrusted_colors)
-        ) or "无"
-        return (
-            f"安全模式={self.mode}; "
-            f"不可信颜色={colors}; "
-            f"保守剩余轮={self.conservative_turns}; "
-            f"原因={self.pause_reason or '无'}"
-        )
 
 
 def _resolve_decision_log_path(args: argparse.Namespace) -> Path:
@@ -228,6 +104,7 @@ def _append_color_observation_log(
     palette = np.asarray(result.palette, dtype=np.float32)
     grid = np.asarray(result.grid)
 
+    health = result.observation_health
     lines = [
         "",
         "=" * 120,
@@ -238,7 +115,8 @@ def _append_color_observation_log(
         f"screenshot_path={screenshot}",
         f"grid_rows={grid.shape[0]} grid_cols={grid.shape[1]}",
         f"palette_count={len(palette)}",
-        f"board_update_status={result.board_update_status}",
+        f"observation_trusted={'yes' if health.trusted else 'no'}",
+        f"observation_reasons={'; '.join(health.reasons) or 'none'}",
         "-" * 120,
         "[PALETTE]",
         "color | RGB             | HEX     | board_cells",
@@ -370,6 +248,7 @@ def _append_number_observation_log(
     }
     queue_columns = sorted(set(front_by_col) | set(next_by_col))
 
+    health = result.observation_health
     lines = [
         "",
         "=" * 104,
@@ -378,7 +257,8 @@ def _append_number_observation_log(
         f"turn={result.turn}",
         f"screenshot={screenshot.name}",
         f"screenshot_path={screenshot}",
-        f"board_update_status={result.board_update_status}",
+        f"observation_trusted={'yes' if health.trusted else 'no'}",
+        f"observation_reasons={'; '.join(health.reasons) or 'none'}",
         "-" * 104,
         "[QUEUE_NUMBERS]",
         "column | front_color | front_number | next_color | next_number",
@@ -724,15 +604,52 @@ def _format_observed_board_observation(observation: ObservedBoard) -> str:
 
 def _observed_board_allows_planning(
     observation: Optional[ObservedBoard],
-    board_update_status: str,
-    causal_input_invalid: str,
+    *,
+    experimental_continue: bool = False,
 ) -> bool:
-    """Defense in depth: an untrusted ObservedBoard never enters the planner."""
-    return bool(
-        observation is not None
-        and observation.health.trusted
-        and board_update_status == "ok"
-        and not str(causal_input_invalid or "").strip()
+    """Default policy is strict; explicit experiment may plan one conservative step."""
+    if observation is None:
+        return False
+    return bool(observation.health.trusted or experimental_continue)
+
+
+def _plan_current_observation(
+    observation: ObservedBoard,
+    grid: np.ndarray,
+    front,
+    nxt,
+    parked,
+    slots: int,
+    occupied_slots: int,
+    *,
+    experimental_continue: bool,
+):
+    """Small execution policy: trusted=normal plan; untrusted=none, or one-step experiment."""
+    trusted = bool(observation.health.trusted)
+    if not trusted and not experimental_continue:
+        return [], None
+
+    candidates = evaluate_candidates(
+        grid,
+        front,
+        nxt,
+        parked,
+        slots,
+        occupied_slots,
+        # An explicit untrusted experiment is intentionally one-step only.
+        include_queue_lookahead=trusted,
+    )
+    if not trusted:
+        return candidates, None
+
+    return candidates, choose_two_step_plan(
+        grid,
+        front,
+        nxt,
+        parked,
+        slots,
+        occupied_slots,
+        candidates,
     )
 
 
@@ -742,22 +659,20 @@ def analyze_image(
     reset: bool,
     slots: int,
     flow_capacity_before_by_color: Optional[Dict[int, int]] = None,
-    strategy_untrusted_colors: Optional[Set[int]] = None,
-    force_single_step: bool = False,
-    disable_parked_chain: bool = False,
     previous_prediction_upper: Optional[int] = None,
     previous_prediction_basis: str = "",
+    experimental_continue: bool = False,
     commit_state: bool = True,
     prev_grid_image_rgb: Optional[np.ndarray] = None,
 ) -> AnalysisResult:
     """
-    分析一张已经稳定的游戏截图。
+    Analyze one stable screenshot.
 
-    v5.7 关键变化：
-      - 因果棋盘异常只返回结构化状态，不在这里直接“杀进程”；
-      - MODEL_INCONSISTENT 只隔离冲突颜色；
-      - GUARANTEE_BROKEN 当前轮直接切换保守策略；
-      - 由自动运行层负责重试、降级、PAUSED_SAFE 与最终 HARD_STOP。
+    Issue 006 trust policy:
+      - ObservationHealth describes this frame only;
+      - trusted -> normal planner;
+      - untrusted -> no planner/no click by default;
+      - explicit experimental continuation -> single-step candidates only.
     """
     image_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
     if image_bgr is None:
@@ -770,9 +685,6 @@ def analyze_image(
     ).astype(np.float32)
 
     front_centers = detect_front_centers(image_bgr)
-
-    # Every stable observation reads the visible first-row numbers directly.
-    # The retired fingerprint cache was explicitly disabled before every use.
     front_numbers = read_front_numbers_at_centers(
         image_bgr,
         front_centers,
@@ -780,9 +692,7 @@ def analyze_image(
     front_ocr_reads = len(front_centers)
 
     removed_since_last: Optional[int]
-    board_observation: Optional[ObservedBoard] = None
-    causal_input_invalid = ""
-    board_update_status = "ok"
+    capacity_validation_error = ""
     new_state = reset or not state_path.exists()
 
     if new_state:
@@ -811,9 +721,6 @@ def analyze_image(
         board_observation = observe_board(image_rgb, palette)
         grid = board_observation.grid
         current_grid_rgb = board_observation.grid_rgb_snapshot
-        if not board_observation.health.trusted:
-            board_update_status = "incomplete"
-
         turn = 0
         removed_since_last = None
         parking_empty_ref = parking_roi(image_bgr)
@@ -854,17 +761,15 @@ def analyze_image(
         )
 
         expected_consumed: Dict[int, int] = {}
-        has_causal_context = flow_capacity_before_by_color is not None
-        if has_causal_context:
-            expected_consumed, causal_input_invalid = (
+        has_capacity_context = flow_capacity_before_by_color is not None
+        if has_capacity_context:
+            expected_consumed, capacity_validation_error = (
                 _actual_consumed_from_capacity_delta(
                     flow_capacity_before_by_color,
                     parked,
                 )
             )
 
-        # Issue 003: spatial state is produced even if the capacity side-channel
-        # is invalid. Invalid quantity data is never allowed to mutate positions.
         board_observation = observe_board(
             image_rgb,
             palette,
@@ -873,7 +778,7 @@ def analyze_image(
             previous_trusted_grid_rgb=prev_grid_rgb,
             consumed_by_color=(
                 expected_consumed
-                if has_causal_context and not causal_input_invalid
+                if has_capacity_context and not capacity_validation_error
                 else None
             ),
         )
@@ -881,17 +786,13 @@ def analyze_image(
         current_grid_rgb = board_observation.grid_rgb_snapshot
         removed_since_last = board_observation.removed_cells
 
-        if causal_input_invalid:
-            board_update_status = "causal_invalid"
-        elif not board_observation.health.trusted:
-            board_update_status = "incomplete"
-
+    health = board_observation.health
     occupied_slots = len(parked)
 
+    # Current-frame OCR / quantity / consistency checks now feed one health object.
     if occupied_slots > slots:
-        raise RuntimeError(
-            f"停车数字锚点检测到 {occupied_slots} 辆，超过设定停车位 {slots}，"
-            "状态已不可解释。"
+        health.add_reason(
+            f"parking_count_exceeds_slots={occupied_slots}/{slots}"
         )
 
     incomplete_parked = [
@@ -899,103 +800,47 @@ def analyze_image(
         if c.color is None or c.remain is None
     ]
     if incomplete_parked:
-        raise RuntimeError(
-            "停车数字已检测到，但有停车车的颜色/剩余数字无法可靠识别。"
+        health.add_reason(
+            "parking_ocr_incomplete="
+            f"{len(incomplete_parked)}/{occupied_slots}"
         )
 
     if front and all(c.remain is None for c in front):
-        raise RuntimeError(
-            "第一排车辆数字全部识别失败。"
+        health.add_reason(f"front_ocr_all_failed={len(front)}")
+
+    if capacity_validation_error:
+        health.add_reason(
+            "capacity_conservation_invalid: " + capacity_validation_error
         )
 
-    stable_conflicts: Dict[int, Tuple[int, Tuple[int, ...]]] = {}
-    if board_update_status == "ok":
-        stable_conflicts = _stable_state_conflicts(grid, parked)
+    stable_conflicts = _stable_state_conflicts(grid, parked)
+    for color, (supply, remains) in sorted(stable_conflicts.items()):
+        health.add_reason(
+            f"stable_parking_reachable_conflict {ctag(color)}:"
+            f"reachable={supply},parked_remaining={list(remains)}"
+        )
 
-    guarantee_broken = bool(
+    prediction_mismatch = bool(
         previous_prediction_upper is not None
         and occupied_slots > int(previous_prediction_upper)
     )
-
-    # ---------- v5.8 实验模式 ----------
-    #
-    # 所有异常都保留为 telemetry，不再从 strategy_grid 中删除颜色、
-    # 不再把 Candidate.rejected 当作禁止点击条件。
-    #
-    # 原因：当前项目已经具备完整 decision_log，现阶段更需要持续收集
-    # “模型预测 vs 真实下一帧”的偏差，而不是在轻微矛盾处停止运行。
-    untrusted: Set[int] = {
-        int(c)
-        for c in (strategy_untrusted_colors or set())
-        if int(c) > 0
-    }
-    untrusted.update(stable_conflicts)
-
-    if disable_parked_chain or guarantee_broken:
-        untrusted.update(
-            int(car.color)
-            for car in parked
-            if car.color is not None and int(car.color) > 0
+    if prediction_mismatch:
+        health.add_warning(
+            "post_action_prediction_mismatch: "
+            f"expected_parking<={int(previous_prediction_upper)},"
+            f"actual={occupied_slots}; basis={previous_prediction_basis or 'unknown'}"
         )
 
-    strategy_grid = grid.copy()
-
-    # v5.17: soft safety warnings no longer blanket-disable two-step.
-    #
-    # When there are >=3 free parking slots, executing two cars can occupy at
-    # most slots-1 even if neither completes. Therefore MODEL_INCONSISTENT,
-    # GUARANTEE_BROKEN, board-sync telemetry and the runtime conservative flag
-    # are not reasons by themselves to skip the normal two-step cadence.
-    #
-    # With fewer than 3 free slots, keep the old single-step degradation so the
-    # solver re-observes after every click. Candidate.rejected and the pair
-    # stable_safe check remain hard safety gates in strategy.py.
-    free_slots = max(0, int(slots) - int(occupied_slots))
-    soft_force_single = bool(
-        force_single_step
-        or guarantee_broken
-        or stable_conflicts
-        or board_update_status != "ok"
-    )
-    local_force_single = bool(
-        soft_force_single
-        and free_slots < 3
-    )
-
-    observation_can_plan = _observed_board_allows_planning(
+    candidates, two_step_plan = _plan_current_observation(
         board_observation,
-        board_update_status,
-        causal_input_invalid,
+        grid,
+        front,
+        nxt,
+        parked,
+        slots,
+        occupied_slots,
+        experimental_continue=bool(experimental_continue),
     )
-
-    if observation_can_plan:
-        candidates = evaluate_candidates(
-            strategy_grid,
-            front,
-            nxt,
-            parked,
-            slots,
-            occupied_slots,
-            include_queue_lookahead=not local_force_single,
-        )
-
-        if local_force_single:
-            two_step_plan = None
-        else:
-            two_step_plan = choose_two_step_plan(
-                strategy_grid,
-                front,
-                nxt,
-                parked,
-                slots,
-                occupied_slots,
-                candidates,
-            )
-    else:
-        # Issue 002 + 003: do not even execute planner ranking on an untrusted
-        # spatial observation. The auto runner will retry / NO_CLICK_UNTRUSTED.
-        candidates = []
-        two_step_plan = None
 
     report = format_report(
         grid,
@@ -1009,24 +854,14 @@ def analyze_image(
         occupied_slots,
         new_colors_added,
     )
+    report += "\n\n" + _format_observed_board_observation(board_observation)
 
-    if board_observation is not None:
-        report += "\n\n" + _format_observed_board_observation(board_observation)
-
-    if soft_force_single and not local_force_single:
+    if capacity_validation_error:
         report += (
-            "\n\n[TWO_STEP_POLICY]\n"
-            f"当前空停车位 {free_slots} >= 3；软安全告警不再强制降为单步。"
-            "连续两步仍必须满足：第一步非 rejected、联合动作 stable_safe，"
-            "并通过正常两步评分与执行确认。"
-        )
-
-    if causal_input_invalid:
-        report += (
-            "\n\n!!! CAUSAL_CAPACITY_INVALID / RETRY_OBSERVATION !!!\n"
-            f"{causal_input_invalid}\n"
-            "本次不修改持久化棋盘、不点击；自动运行层会重新截图尝试恢复，"
-            "不会立即退出程序。"
+            "\n\n!!! CAPACITY_VALIDATION_UNTRUSTED / RETRY_OBSERVATION !!!\n"
+            f"{capacity_validation_error}\n"
+            "容量侧信道只参与数量校验；当前 observation 已标记不可信，"
+            "默认不提交、不点击。"
         )
 
     palette_diag = _format_palette_diagnostics(palette)
@@ -1036,19 +871,24 @@ def analyze_image(
             + palette_diag
         )
 
-    if board_observation is not None and not board_observation.health.trusted:
+    if not health.trusted:
         problem_colors = sorted(
-            set(board_observation.health.capacity_remaining_by_color)
-            | set(board_observation.health.capacity_excess_by_color)
+            set(health.capacity_remaining_by_color)
+            | set(health.capacity_excess_by_color)
         )
         report += (
             "\n\n!!! OBSERVATION_UNTRUSTED / RETRY_OBSERVATION !!!\n"
-            "当前帧 ObservedBoard 未通过 trust gate。默认严格模式不提交、不点击；"
-            "history 只解析当前 UNKNOWN，capacity 只做数量审计。"
+            "当前稳定帧 ObservationHealth 未通过 trust gate。默认严格模式"
+            "不提交、不点击。"
             f"\n问题颜色: "
             f"{', '.join(ctag(c) for c in problem_colors) or '无特定颜色'}"
-            f"\n原因: {'；'.join(board_observation.health.reasons) or '未提供'}"
+            f"\n原因: {'；'.join(health.reasons) or '未提供'}"
         )
+        if experimental_continue:
+            report += (
+                "\n显式 experimental continuation：仅生成单步候选，"
+                "不生成两步计划。"
+            )
 
     if stable_conflicts:
         conflict_text = "；".join(
@@ -1060,26 +900,19 @@ def analyze_image(
             in sorted(stable_conflicts.items())
         )
         report += (
-            "\n\n!!! MODEL_INCONSISTENT / EXPERIMENT_WARNING !!!\n"
+            "\n\n!!! OBSERVATION_VALIDATION_CONFLICT !!!\n"
             f"矛盾项: {conflict_text}\n"
-            "仅记录模型矛盾，不隔离颜色、不 veto 候选。"
-            "当前轮最多降为单步，继续收集下一稳定截图验证模型。"
+            "稳定截图中停车车仍有同色 reachable，属于当前 observation "
+            "一致性失败；默认 retry/no-click。"
         )
 
-    if guarantee_broken:
+    if prediction_mismatch:
         report += (
-            "\n\n!!! GUARANTEE_BROKEN / EXPERIMENT_WARNING !!!\n"
-            f"上一轮保证稳定停车占用 <= {previous_prediction_upper}，"
+            "\n\n!!! POST_ACTION_PREDICTION_MISMATCH / DIAGNOSTIC !!!\n"
+            f"上一动作预测稳定停车占用 <= {previous_prediction_upper}，"
             f"当前稳定截图实际为 {occupied_slots}/{slots}。\n"
-            f"上一轮依据: {previous_prediction_basis or '未记录'}\n"
-            "该结果只作为模型校准证据写入日志；当前轮继续运行，"
-            "最多降为单步实验。"
-        )
-
-    if untrusted:
-        report += (
-            "\n\n模型不可信颜色（仅日志标记，不阻止点击）: "
-            + ", ".join(ctag(c) for c in sorted(untrusted))
+            f"上一动作依据: {previous_prediction_basis or '未记录'}\n"
+            "该信息只作为当前帧 warning，不累计模式、不触发多轮恢复状态。"
         )
 
     if two_step_plan is not None:
@@ -1088,18 +921,8 @@ def analyze_image(
     else:
         best = best_valid_candidate(candidates)
 
-    # Issue 003: a direct analyze_image(commit_state=True) call must not persist
-    # an untrusted spatial observation either. Auto retry still passes
-    # commit_state=False and commits the selected trusted result externally.
     turn += 1
-    state_saved = bool(
-        commit_state
-        and _observed_board_allows_planning(
-            board_observation,
-            board_update_status,
-            causal_input_invalid,
-        )
-    )
+    state_saved = bool(commit_state and health.trusted)
     if state_saved:
         save_state(
             state_path,
@@ -1112,17 +935,6 @@ def analyze_image(
                 previous_trusted_grid_rgb=current_grid_rgb,
             ),
         )
-
-    remaining_by_color = (
-        dict(board_observation.health.capacity_remaining_by_color)
-        if board_observation is not None
-        else {}
-    )
-    excess_by_color = (
-        dict(board_observation.health.capacity_excess_by_color)
-        if board_observation is not None
-        else {}
-    )
 
     return AnalysisResult(
         report=report,
@@ -1140,20 +952,11 @@ def analyze_image(
         new_colors_added=new_colors_added,
         front_ocr_reads=front_ocr_reads,
         two_step_plan=two_step_plan,
-        board_update_status=board_update_status,
-        board_update_remaining_by_color=remaining_by_color,
-        board_update_excess_by_color=excess_by_color,
-        causal_input_invalid=causal_input_invalid,
-        model_conflict_colors=sorted(stable_conflicts),
-        strategy_untrusted_colors=sorted(untrusted),
-        guarantee_broken=guarantee_broken,
-        guarantee_expected_upper=previous_prediction_upper,
+        observation_health=health,
         state_saved=state_saved,
-        observation_health=(
-            board_observation.health if board_observation is not None else None
-        ),
         grid_rgb_snapshot=current_grid_rgb,
     )
+
 
 def queue_empty_on_image(
     image_bgr: np.ndarray,
@@ -1480,27 +1283,11 @@ def run_manual_step_mode(args: argparse.Namespace) -> int:
 
 
 
-def _retriable_analysis_error(exc: RuntimeError) -> bool:
-    text = str(exc)
-    return any(
-        token in text
-        for token in (
-            "停车数字已检测到",
-            "第一排车辆数字全部识别失败",
-            "无法可靠识别",
-        )
-    )
-
-
-
 def _commit_analysis_result_state(
     state_path: Path,
     result: AnalysisResult,
 ) -> None:
-    """
-    Retry-safe commit of the selected trusted observation as historical context.
-    Retry attempts remain read-only; persisted context is never current-frame authority.
-    """
+    """Commit the selected observation as historical context after the gate."""
     save_state(
         state_path,
         TrustedSessionState(
@@ -1516,52 +1303,28 @@ def _commit_analysis_result_state(
 
 
 def _observation_quality(result: AnalysisResult) -> Tuple[int, int, int]:
-    """
-    越小越好。用于多次稳定观测中选择最完整的一次，而不是机械使用最后一次。
-
-    0: 完整同步
-    1: incomplete，按剩余预算总量排序
-    2: causal_invalid
-    """
-    if result.board_update_status == "ok":
-        return (0, 0, -int(result.grid.size))
-    if result.board_update_status == "incomplete":
-        remaining = sum(
-            max(0, int(v))
-            for v in result.board_update_remaining_by_color.values()
-        )
-        excess = sum(
-            max(0, int(v))
-            for v in result.board_update_excess_by_color.values()
-        )
-        return (1, remaining + excess, -int(np.count_nonzero(result.grid == 0)))
-    return (2, 10**9, 0)
+    """Lower is better: trusted first, then fewer reasons, then fewer UNKNOWN cells."""
+    health = getattr(result, "observation_health", None)
+    if health is None:
+        return (2, 10**9, 10**9)
+    return (
+        0 if bool(health.trusted) else 1,
+        len(health.reasons),
+        int(health.unknown_cells),
+    )
 
 
 def _observation_trust(
     result: AnalysisResult,
 ) -> Tuple[bool, Tuple[str, ...]]:
-    """Return whether an analysis is trusted enough to commit and plan."""
-    reasons: List[str] = []
-    status = str(getattr(result, "board_update_status", "") or "unknown").strip()
-    if status != "ok":
-        reasons.append(f"board_update_status={status}")
-
-    causal_invalid = str(
-        getattr(result, "causal_input_invalid", "") or ""
-    ).strip()
-    if causal_invalid:
-        reasons.append(f"causal_input_invalid={causal_invalid}")
-
+    """Read the one canonical current-observation trust signal."""
     health = getattr(result, "observation_health", None)
-    if health is not None and not bool(getattr(health, "trusted", False)):
-        health_reasons = list(getattr(health, "reasons", ()) or ())
-        if health_reasons:
-            reasons.extend(f"observed_board={reason}" for reason in health_reasons)
-        else:
-            reasons.append("observed_board=untrusted")
-
-    return (len(reasons) == 0), tuple(reasons)
+    if health is None:
+        return False, ("observation_health_missing",)
+    reasons = tuple(str(reason) for reason in (health.reasons or ()))
+    if not bool(health.trusted) and not reasons:
+        reasons = ("observation_untrusted_without_reason",)
+    return bool(health.trusted), reasons
 
 
 def run_auto_flow_mode(args: argparse.Namespace) -> int:
@@ -1587,7 +1350,6 @@ def _run_auto_flow_mode_impl(
     pending_prediction: Optional[Tuple[int, str, str]] = None
     pending_flow_capacity_before_by_color: Optional[Dict[int, int]] = None
     committed_analysis_rgb: Optional[np.ndarray] = None
-    safety = _SafetyRuntime()
     log_path = _resolve_decision_log_path(args)
     color_log_path = _resolve_color_log_path(args)
     number_log_path = _resolve_number_log_path(args)
@@ -1626,13 +1388,13 @@ def _run_auto_flow_mode_impl(
     )
     if experimental_continue:
         print(
-            "EXPERIMENTAL_CONTINUE 已启用：bounded retry 后仍不可信的观测"
-            "允许提交保守状态并继续；仅用于诊断实验。"
+            "EXPERIMENTAL_CONTINUE 已启用：bounded retry 后仍不可信的 observation "
+            "可显式提交，但只生成单步候选；不维护恢复模式历史。"
         )
     else:
         print(
-            "严格观测门已启用：bounded retry 后仍不可信则 NO_CLICK_UNTRUSTED；"
-            "不提交状态、不结束 checkpoint、不执行 ADB 点击。"
+            "严格观测门已启用：ObservationHealth.trusted=false 经 bounded retry 后 "
+            "仍为 NO_CLICK_UNTRUSTED；不提交、不点击。"
         )
 
     while True:
@@ -1653,11 +1415,6 @@ def _run_auto_flow_mode_impl(
 
         flow_context = pending_flow_capacity_before_by_color
         prediction_context = pending_prediction
-
-        result: Optional[AnalysisResult] = None
-        analysis_bgr: Optional[np.ndarray] = None
-        shot: Optional[Path] = None
-        last_retry_error = ""
 
         best_observation_result: Optional[AnalysisResult] = None
         best_observation_shot: Optional[Path] = None
@@ -1697,61 +1454,32 @@ def _run_auto_flow_mode_impl(
                     hint=(
                         "正在识别棋盘、队列与停车车辆。"
                         if observation_attempt == 1
-                        else "上一张观测存在可恢复异常；重新截图确认，不执行点击。"
+                        else "上一张 ObservationHealth 不可信；重新截图确认，不点击。"
                     ),
                 )
 
-            try:
-                result = analyze_image(
-                    shot,
-                    args.state,
-                    reset=(reset_current or not args.state.exists()),
-                    slots=args.slots,
-                    flow_capacity_before_by_color=flow_context,
-                    strategy_untrusted_colors=safety.untrusted_colors,
-                    force_single_step=safety.force_single_step,
-                    disable_parked_chain=safety.disable_parked_chain,
-                    previous_prediction_upper=(
-                        prediction_context[0]
-                        if prediction_context is not None
-                        else None
-                    ),
-                    previous_prediction_basis=(
-                        prediction_context[2]
-                        if prediction_context is not None
-                        else ""
-                    ),
-                    # v5.9：retry 期间禁止写 solver_state。
-                    # 所有 attempt 必须从同一个 committed state 重算。
-                    commit_state=False,
-                    prev_grid_image_rgb=committed_analysis_rgb,
-                )
-            except RuntimeError as exc:
-                if not _retriable_analysis_error(exc):
-                    raise
+            result = analyze_image(
+                shot,
+                args.state,
+                reset=(reset_current or not args.state.exists()),
+                slots=args.slots,
+                flow_capacity_before_by_color=flow_context,
+                previous_prediction_upper=(
+                    prediction_context[0]
+                    if prediction_context is not None
+                    else None
+                ),
+                previous_prediction_basis=(
+                    prediction_context[2]
+                    if prediction_context is not None
+                    else ""
+                ),
+                experimental_continue=experimental_continue,
+                # Retry attempts are read-only and share the same committed state.
+                commit_state=False,
+                prev_grid_image_rgb=committed_analysis_rgb,
+            )
 
-                last_retry_error = str(exc)
-                _append_execution_update(
-                    log_path,
-                    screenshot=shot,
-                    step_label=step_label,
-                    execution=(
-                        "RETRY_OBSERVATION "
-                        f"attempt={observation_attempt}/{max_observation_attempts}; "
-                        f"reason={last_retry_error}"
-                    ),
-                )
-                if observation_attempt < max_observation_attempts:
-                    time.sleep(retry_delay)
-                    continue
-
-                safety.pause(
-                    "停车/第一排 OCR 连续多次无法形成可信稳定状态"
-                )
-                result = None
-                break
-
-            # 记录当前轮最完整的一次观测。即使后续 retry 更差，也不会覆盖它。
             if (
                 best_observation_result is None
                 or _observation_quality(result)
@@ -1761,12 +1489,9 @@ def _run_auto_flow_mode_impl(
                 best_observation_shot = shot
                 best_observation_bgr = analysis_bgr
 
-            # 不可信观测先 bounded retry；retry 期间绝不提交状态或点击。
-            attempt_trusted, attempt_untrusted_reasons = _observation_trust(result)
-            if (
-                not attempt_trusted
-                and observation_attempt < max_observation_attempts
-            ):
+            attempt_trusted, attempt_reasons = _observation_trust(result)
+            if not attempt_trusted and observation_attempt < max_observation_attempts:
+                health = result.observation_health
                 _append_execution_update(
                     log_path,
                     screenshot=shot,
@@ -1774,9 +1499,10 @@ def _run_auto_flow_mode_impl(
                     execution=(
                         "RETRY_OBSERVATION "
                         f"attempt={observation_attempt}/{max_observation_attempts}; "
-                        f"reasons={'; '.join(attempt_untrusted_reasons)}; "
-                        f"remaining={result.board_update_remaining_by_color}; "
-                        f"excess={result.board_update_excess_by_color}"
+                        f"reasons={'; '.join(attempt_reasons)}; "
+                        f"unknown={health.unknown_cells}; "
+                        f"capacity_remaining={health.capacity_remaining_by_color}; "
+                        f"capacity_excess={health.capacity_excess_by_color}"
                     ),
                 )
                 time.sleep(retry_delay)
@@ -1784,37 +1510,12 @@ def _run_auto_flow_mode_impl(
 
             break
 
-        # 如果至少有一次成功分析，使用本轮质量最好的 observation。
-        # 这同时防止“第一次 39/55，后续 retry 反而 0/55”之类的退化覆盖。
-        if best_observation_result is not None:
-            result = best_observation_result
-            shot = best_observation_shot
-            analysis_bgr = best_observation_bgr
-
-        if result is None:
-            print(
-                "进入 PAUSED_SAFE：观测连续失败。程序保持运行，"
-                "稍后重新截图尝试恢复，不执行点击。"
-            )
-            if shot is not None:
-                _append_execution_update(
-                    log_path,
-                    screenshot=shot,
-                    step_label=step_label,
-                    execution=(
-                        "PAUSED_SAFE observation failure; "
-                        f"reason={last_retry_error or safety.pause_reason}"
-                    ),
-                )
-            time.sleep(
-                max(
-                    0.2,
-                    float(getattr(args, "safe_pause_retry_delay", 1.0)),
-                )
-            )
-            continue
-
-        assert shot is not None
+        # analyze_image either returns a structured observation or raises a fatal error.
+        assert best_observation_result is not None
+        assert best_observation_shot is not None
+        result = best_observation_result
+        shot = best_observation_shot
+        analysis_bgr = best_observation_bgr
 
         observation_trusted, untrusted_reasons = _observation_trust(result)
         untrusted_reason_text = "; ".join(untrusted_reasons) or "none"
@@ -1823,8 +1524,8 @@ def _run_auto_flow_mode_impl(
             result.report += (
                 "\n\n[NO_CLICK_UNTRUSTED]\n"
                 f"reasons={untrusted_reason_text}\n"
-                "严格模式拒绝本轮观测：不提交 solver_state、不结束上一动作 "
-                "checkpoint、不进入候选点击；保留诊断结果并继续重新观测。"
+                "严格模式拒绝本轮 observation：不提交 solver_state、不结束上一动作 "
+                "checkpoint、不进入候选点击；继续重新观测。"
             )
             print(result.report)
             _append_decision_log(
@@ -1855,12 +1556,12 @@ def _run_auto_flow_mode_impl(
                     analysis_bgr,
                     stage="NO_CLICK_UNTRUSTED",
                     hint=(
-                        "重试后观测仍不可信；严格模式保持上一份 trusted state，"
+                        "重试后 observation 仍不可信；保持上一份 trusted state，"
                         "不点击，继续重新观测。"
                     ),
                 )
             print(
-                "NO_CLICK_UNTRUSTED：重试后观测仍不可信；"
+                "NO_CLICK_UNTRUSTED：重试后 observation 仍不可信；"
                 "未提交状态、未结束 checkpoint、未执行点击。"
             )
             time.sleep(retry_delay)
@@ -1870,11 +1571,11 @@ def _run_auto_flow_mode_impl(
             result.report += (
                 "\n\n[EXPERIMENT_CONTINUE_UNTRUSTED]\n"
                 f"reasons={untrusted_reason_text}\n"
-                "--experimental-continue 已显式启用；允许提交当前保守 grid "
-                "并继续诊断运行。"
+                "--experimental-continue 已显式启用；提交当前保守 grid，"
+                "且本轮只允许单步候选。"
             )
 
-        # 只有可信观测，或显式 experimental opt-in，才允许推进 committed state。
+        # Trusted observation, or one explicit experimental opt-in, advances context.
         _commit_analysis_result_state(args.state, result)
         if analysis_bgr is not None:
             committed_analysis_rgb = cv2.cvtColor(
@@ -1883,25 +1584,8 @@ def _run_auto_flow_mode_impl(
             ).astype(np.float32)
 
         reset_current = False
-        sync_pending = not observation_trusted
-
-        # 只有走过 observation gate 的观测才结束上一动作 checkpoint。
         pending_flow_capacity_before_by_color = None
         pending_prediction = None
-
-        # SafetyRuntime 现在只保留 telemetry/单步降级信息，不再拥有 veto 权。
-        if result.guarantee_broken:
-            safety.note_guarantee_broken(round_no)
-        if result.model_conflict_colors:
-            safety.note_model_conflict(result.model_conflict_colors)
-        if not result.guarantee_broken and not result.model_conflict_colors:
-            safety.note_clean()
-
-        result.report += (
-            "\n\n[EXPERIMENT_STATE]\n"
-            + safety.status_line()
-            + "\n上述状态仅影响诊断和必要时的单步/多步选择，不阻止点击。"
-        )
 
         print(result.report)
         print(
@@ -1909,15 +1593,12 @@ def _run_auto_flow_mode_impl(
             "每个稳定 observation 均重新读取，不跨车辆复用旧数字。"
         )
 
-        # 每一步先落盘完整决策依据，确保即使后续点击/监控异常也能追溯。
         _append_decision_log(
             log_path,
             screenshot=shot,
             result=result,
             step_label=step_label,
         )
-        # 与 decision_log 使用同一份最终稳定 AnalysisResult。
-        # RETRY_OBSERVATION 中间帧不会写入颜色/数字表。
         _append_observation_table_logs(
             color_log_path,
             number_log_path,
@@ -1926,16 +1607,14 @@ def _run_auto_flow_mode_impl(
             step_label=step_label,
         )
 
-        if sync_pending:
+        if not observation_trusted:
             _append_execution_update(
                 log_path,
                 screenshot=shot,
                 step_label=step_label,
                 execution=(
                     "EXPERIMENT_CONTINUE_UNTRUSTED; "
-                    f"reasons={untrusted_reason_text}; "
-                    "continue-with-conservative-grid; "
-                    + safety.status_line()
+                    f"reasons={untrusted_reason_text}; single-step-only"
                 ),
             )
             if analysis_bgr is not None:
@@ -1943,13 +1622,13 @@ def _run_auto_flow_mode_impl(
                     analysis_bgr,
                     stage="实验继续 · 不可信观测",
                     hint=(
-                        "--experimental-continue 已显式启用；当前保守状态已提交，"
-                        "继续执行候选，仅用于诊断实验。"
+                        "--experimental-continue 已显式启用；"
+                        "当前保守状态已提交，本轮仅允许单步候选。"
                     ),
                 )
             print(
                 "EXPERIMENT_CONTINUE_UNTRUSTED：显式实验开关已启用；"
-                "继续使用当前保守 grid。"
+                "当前轮仅执行单步候选。"
             )
 
         if len(result.front) == 0 and len(result.nxt) == 0:

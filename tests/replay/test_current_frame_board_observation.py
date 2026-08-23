@@ -171,4 +171,7 @@ def test_untrusted_observed_board_cannot_enter_planner():
             reasons=["forbidden_transition R01C01:C01->C02"],
         )
     )
-    assert not engine._observed_board_allows_planning(observation, "ok", "")
+    assert not engine._observed_board_allows_planning(observation)
+    assert engine._observed_board_allows_planning(
+        observation, experimental_continue=True
+    )

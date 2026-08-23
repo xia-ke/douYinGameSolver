@@ -155,8 +155,8 @@ def main() -> int:
         type=int,
         default=3,
         help=(
-            "棋盘因果更新/OCR观测异常时，当前轮最多重新截图确认次数，默认 3。"
-            "重试期间绝不点击。"
+            "ObservationHealth/OCR/数量校验不可信时，当前轮最多重新截图确认次数，"
+            "默认 3。重试期间绝不点击。"
         ),
     )
     parser.add_argument(
@@ -169,16 +169,8 @@ def main() -> int:
         "--experimental-continue",
         action="store_true",
         help=(
-            "显式允许自动模式在 bounded retry 后仍对 incomplete/causal_invalid "
-            "观测提交保守状态并继续点击；默认关闭，仅用于诊断实验。"
-        ),
-    )
-    parser.add_argument(
-        "--safe-pause-retry-delay",
-        type=float,
-        default=1.0,
-        help=(
-            "PAUSED_SAFE 状态下不点击、仅重新截图分析的等待间隔，默认 1 秒"
+            "显式允许自动模式在 bounded retry 后仍对 ObservationHealth 不可信的"
+            "观测提交当前保守状态，并仅生成单步候选继续诊断；默认关闭。"
         ),
     )
     parser.add_argument(
@@ -237,7 +229,6 @@ def main() -> int:
         "queue_empty_confirm_delay",
         "analysis_settle_delay",
         "observation_retry_delay",
-        "safe_pause_retry_delay",
         "unlock_ad_wait",
         "unlock_return_settle_delay",
     ):
