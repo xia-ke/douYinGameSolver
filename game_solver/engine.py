@@ -18,7 +18,7 @@ from .config import FRONT_Y_N
 from .display import ClickMark, SolverDisplay
 from .models import AnalysisResult, Candidate, TwoStepPlan
 from .monitor import wait_for_parking_idle
-from .ocr import read_number_at, read_number_detailed_at
+from .ocr import read_number_detailed_at
 from .state import TrustedSessionState, load_state, save_state
 from .strategy import (
     best_valid_candidate, choose_two_step_plan, evaluate_candidates,
@@ -681,7 +681,7 @@ def _front_candidate_signature_on_frame(
     result: AnalysisResult,
     candidate: Candidate,
 ) -> Tuple[Optional[int], Optional[int]]:
-    """v5.12 click confirmation: read color/number at the old front position."""
+    """Read color/number at the old front position for click confirmation."""
     car = next(
         (c for c in result.front if c.column == candidate.column),
         None,
@@ -690,12 +690,12 @@ def _front_candidate_signature_on_frame(
         return None, None
     rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
     color = car_color_at(rgb, float(car.x), float(car.y), result.palette)
-    number, _conf, _votes = read_number_detailed_at(
+    number_result = read_number_detailed_at(
         frame_bgr,
         float(car.x),
         float(car.y),
     )
-    return color, number
+    return color, number_result.value
 
 
 def _has_distinguishable_known_next(

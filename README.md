@@ -166,7 +166,7 @@ pytest tests\replay\
 - `game_solver/monitor.py`：停车数字像素变化监控；与 OCR 解耦。
 - `game_solver/unlock.py`：新局第 6 停车位解锁流程与游戏界面判定。
 - `game_solver/debug.py`：report、decision/color/number logs 与 observation diagnostics。
-- `game_solver/engine.py`：capture → perception → trust → plan → execute → monitor → commit 的运行编排。
+- `game_solver/engine.py`：capture → perception → trust → plan → trusted-context commit → execute → monitor 的运行编排。
 - `game_solver/cli.py`：命令行入口与参数校验。
 
 ## 当前验证边界

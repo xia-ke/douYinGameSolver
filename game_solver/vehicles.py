@@ -263,7 +263,7 @@ def extend_palette_from_front_numbers(
 ) -> Tuple[np.ndarray, int]:
     """
     运行中动态追加新颜色。
-    列中心来自当前截图动态检测，不再依赖固定 FRONT_X_N。
+    列中心完全来自当前截图的动态检测结果。
     """
     h, _w = image_rgb.shape[:2]
     centers: List[np.ndarray] = [p.astype(np.float32) for p in palette]

@@ -34,7 +34,7 @@ _UI_VISIBLE_CENTER_DIST = 30.0
 # A logical cell is ~21x18 px at the reference resolution.  Center 2x2 RGB
 # is too fragile when a disappearing block is covered by a car body / foot /
 # shadow, and absolute distance-to-one-palette-color is ambiguous for close
-# palette pairs.  The v5.14 classifier therefore:
+# palette pairs.  The current classifier therefore:
 #   - uses an inner cell patch;
 #   - labels pixels by nearest palette color with a separation margin;
 #   - compares exactly the pixels that belonged to the old color;
@@ -329,7 +329,7 @@ def _pixel_background_mask(
     """
     Return pixels that are visually better explained by board background.
 
-    v5.16 fixes an important false-negative:
+    The current background model avoids an important false-negative:
     the real gray background can be only ~35 RGB units away from a palette
     center (for example C07 in level 15).  The old absolute rule
     ``nearest_palette >= 36`` therefore classified exact gray background as a
@@ -674,7 +674,7 @@ def _sample_grid_cell_color_coverage(
     """
     Return exclusive pixel coverage for one palette color in a logical cell.
 
-    v5.14: pixels are assigned to the nearest sufficiently separated palette
+    Pixels are assigned to the nearest sufficiently separated palette
     color.  This fixes the old failure where a nearby palette color could also
     satisfy ``distance(target) < 44`` and be counted as survival of ``color``.
     """
@@ -888,7 +888,7 @@ def _looks_like_empty_background(
     """
     Decide whether one RGB sample is genuinely board background.
 
-    v5.16 uses background-vs-palette competition instead of an absolute
+    Uses background-vs-palette competition instead of an absolute
     distance from every palette center.  Exact gray background is allowed to
     be geometrically close to a real color as long as it is substantially
     closer to the learned background model.
