@@ -15,6 +15,8 @@ from .config import (
     UNKNOWN, EMPTY,
 )
 
+from .models import ObservationHealth
+
 
 # ------------------ 增量棋盘更新 ------------------
 #
@@ -190,6 +192,37 @@ class CausalBoardUpdate:
             and not self.excess_by_color
         )
 
+
+
+
+@dataclass
+class ObservedBoard:
+    """
+    One stable-frame spatial observation.
+
+    ``grid`` is created from the current frame first. Historical state is only
+    allowed to resolve cells that the current frame left UNKNOWN, or to validate
+    transition invariants. Capacity data is quantity-only diagnostics.
+    """
+
+    grid: np.ndarray
+    health: ObservationHealth
+    evidence_by_cell: Dict[Tuple[int, int], str]
+    background_rgb: Optional[np.ndarray]
+    grid_rgb_snapshot: np.ndarray
+    current_color_cells: int
+    current_empty_cells: int
+    current_unknown_cells: int
+    history_resolved_cells: int
+    temporal_resolved_empty_cells: int
+    removed_cells: int
+    visual_removed_by_color: Dict[int, int]
+    direct_empty_by_color: Dict[int, int]
+    temporal_empty_by_color: Dict[int, int]
+    history_resolved_by_color: Dict[int, int]
+    capacity_expected_by_color: Dict[int, int]
+    previous_grid_rgb_available: bool
+    previous_frame_available: bool
 
 def ctag(color: Optional[int]) -> str:
     if color is None or color <= 0:
@@ -1075,6 +1108,557 @@ def _recover_unknown_color(
     if float(d[idx]) < _INCREMENTAL_UNKNOWN_RECOVER_DIST:
         return 1 + idx
     return None
+
+
+# ---------------------------------------------------------------------------
+# Issue 003: current-stable-frame board observation authority
+# ---------------------------------------------------------------------------
+
+def _background_zone_support(background_mask: np.ndarray) -> int:
+    """Count 3x3 sub-zones that are predominantly current-frame background."""
+    if background_mask.size == 0:
+        return 0
+    hh, ww = background_mask.shape
+    zones = 0
+    for yi in range(3):
+        y1 = (hh * yi) // 3
+        y2 = (hh * (yi + 1)) // 3
+        for xi in range(3):
+            x1 = (ww * xi) // 3
+            x2 = (ww * (xi + 1)) // 3
+            zone = background_mask[y1:y2, x1:x2]
+            if zone.size and float(np.mean(zone)) >= _RECOG_EMPTY_ZONE_COVERAGE:
+                zones += 1
+    return zones
+
+
+def _classify_current_frame_cell(
+    image_rgb: np.ndarray,
+    r: int,
+    c: int,
+    palette: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+) -> Tuple[int, str]:
+    """Classify one cell using the current stable image only."""
+    patch = _sample_grid_cell_inner_patch(image_rgb, r, c)
+    if patch.size == 0:
+        return UNKNOWN, "current:unknown:empty-patch"
+
+    labels = _palette_pixel_labels(patch, palette)
+    background_mask = _pixel_background_mask(patch, background_rgb, palette)
+
+    # A pixel explained better by board background must not also vote for a
+    # close palette color (the level-15 gray/C07 failure mode).
+    if labels.size:
+        labels = labels.copy()
+        labels[background_mask] = UNKNOWN
+
+    bg_coverage = float(np.mean(background_mask)) if background_mask.size else 0.0
+    bg_zones = _background_zone_support(background_mask)
+
+    winner_color: Optional[int] = None
+    winner_coverage = 0.0
+    winner_margin = 0.0
+    winner_count = 0
+    if labels.size and len(palette) > 0:
+        counts = np.asarray(
+            [
+                int(np.count_nonzero(labels == color))
+                for color in range(1, len(palette) + 1)
+            ],
+            dtype=np.int32,
+        )
+        winner_idx = int(np.argmax(counts))
+        winner_count = int(counts[winner_idx])
+        winner_coverage = float(winner_count / labels.size)
+        if len(counts) >= 2:
+            runner_up = int(np.partition(counts, -2)[-2])
+        else:
+            runner_up = 0
+        winner_margin = float((winner_count - runner_up) / labels.size)
+        if (
+            winner_count >= _RECOG_CELL_MIN_COLOR_PIXELS
+            and winner_coverage >= _RECOG_CELL_MIN_COLOR_COVERAGE
+            and winner_margin >= _RECOG_CELL_MIN_WIN_MARGIN
+        ):
+            winner_color = winner_idx + 1
+
+    h, w = image_rgb.shape[:2]
+    cx, cy = _grid_cell_center(r, c, w, h)
+    covered = ui_covered(cx, cy, w, h)
+
+    if covered:
+        center_rgb = _sample_grid_cell(image_rgb, r, c)
+        center_bg = _looks_like_empty_background(center_rgb, background_rgb, palette)
+        empty_confident = bool(
+            center_bg
+            and bg_coverage >= _RECOG_UI_EMPTY_MIN_BG_COVERAGE
+            and bg_zones >= _RECOG_UI_EMPTY_MIN_BG_ZONES
+        )
+
+        color_confident = False
+        if winner_color is not None:
+            d = np.linalg.norm(
+                np.asarray(palette, dtype=np.float32) - center_rgb[None, :],
+                axis=1,
+            )
+            idx = int(d.argmin())
+            color_confident = bool(
+                idx + 1 == winner_color
+                and float(d[idx]) <= _UI_VISIBLE_CENTER_DIST
+                and winner_coverage >= 0.50
+                and winner_margin >= 0.20
+            )
+    else:
+        empty_confident = bool(
+            background_rgb is not None
+            and bg_coverage >= _RECOG_EMPTY_MIN_BG_COVERAGE
+            and bg_zones >= _RECOG_EMPTY_MIN_BG_ZONES
+        )
+        color_confident = winner_color is not None
+
+    if empty_confident and color_confident:
+        return (
+            UNKNOWN,
+            "current:unknown:color-background-conflict:"
+            f"color={winner_color},color_cov={winner_coverage:.3f},"
+            f"bg_cov={bg_coverage:.3f},bg_zones={bg_zones}",
+        )
+    if empty_confident:
+        return EMPTY, f"current:empty:bg_cov={bg_coverage:.3f},bg_zones={bg_zones}"
+    if color_confident and winner_color is not None:
+        return (
+            int(winner_color),
+            f"current:{ctag(winner_color)}:coverage={winner_coverage:.3f},"
+            f"margin={winner_margin:.3f}",
+        )
+
+    return (
+        UNKNOWN,
+        "current:unknown:"
+        f"best_color={winner_color or 0},coverage={winner_coverage:.3f},"
+        f"margin={winner_margin:.3f},bg_cov={bg_coverage:.3f},"
+        f"bg_zones={bg_zones}",
+    )
+
+
+def _classify_current_frame_grid(
+    image_rgb: np.ndarray,
+    palette: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+) -> Tuple[np.ndarray, Dict[Tuple[int, int], str]]:
+    """Fresh 52x38 COLOR/EMPTY/UNKNOWN classification; no historical input."""
+    grid = np.full((GRID_ROWS, GRID_COLS), UNKNOWN, dtype=np.int16)
+    evidence: Dict[Tuple[int, int], str] = {}
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            value, why = _classify_current_frame_cell(
+                image_rgb, r, c, palette, background_rgb
+            )
+            grid[r, c] = int(value)
+            evidence[(r, c)] = why
+    return grid, evidence
+
+
+def _direct_transition_conflicts(
+    previous_grid: np.ndarray,
+    current_direct_grid: np.ndarray,
+) -> List[Tuple[int, int, int, int]]:
+    """Return forbidden transitions strongly asserted by the current frame."""
+    conflicts: List[Tuple[int, int, int, int]] = []
+    for r in range(GRID_ROWS):
+        for c in range(GRID_COLS):
+            old = int(previous_grid[r, c])
+            cur = int(current_direct_grid[r, c])
+            if cur <= 0:
+                continue
+            if old == EMPTY:
+                conflicts.append((r, c, old, cur))
+            elif old > 0 and old != cur:
+                conflicts.append((r, c, old, cur))
+    return conflicts
+
+
+def _temporal_old_color_disappeared(
+    evidence: _CellVisualEvidence,
+    *,
+    covered_by_fixed_ui: bool,
+) -> bool:
+    strong = bool(
+        evidence.loss_ratio >= _RECOG_DISAPPEAR_LOSS_RATIO
+        and evidence.change_ratio >= _RECOG_DISAPPEAR_CHANGE_RATIO
+        and evidence.stable_ratio <= _RECOG_DISAPPEAR_STABLE_MAX
+        and evidence.curr_color_coverage <= _RECOG_DISAPPEAR_CURR_COVERAGE_MAX
+        and (
+            evidence.zone_support >= 2
+            or evidence.background_ratio >= _RECOG_DISAPPEAR_BG_RATIO
+            or evidence.strong_change_ratio >= 0.48
+        )
+    )
+    very_strong = bool(
+        evidence.loss_ratio >= _RECOG_VERY_STRONG_LOSS_RATIO
+        and evidence.change_ratio >= _RECOG_VERY_STRONG_CHANGE_RATIO
+        and evidence.stable_ratio <= _RECOG_VERY_STRONG_STABLE_MAX
+        and evidence.curr_color_coverage <= _RECOG_VERY_STRONG_CURR_COVERAGE_MAX
+        and (
+            evidence.zone_support >= 2
+            or evidence.background_ratio >= 0.20
+            or evidence.strong_change_ratio >= 0.68
+        )
+    )
+    if covered_by_fixed_ui:
+        return bool(very_strong and evidence.background_ratio >= 0.20)
+    return bool(strong or very_strong)
+
+
+def _resolve_unknown_from_history(
+    current_grid: np.ndarray,
+    evidence_by_cell: Dict[Tuple[int, int], str],
+    image_rgb: np.ndarray,
+    palette: np.ndarray,
+    background_rgb: Optional[np.ndarray],
+    previous_grid: np.ndarray,
+    current_grid_rgb: np.ndarray,
+    previous_grid_rgb: Optional[np.ndarray],
+    previous_frame_rgb: Optional[np.ndarray],
+) -> Tuple[
+    np.ndarray,
+    Dict[Tuple[int, int], str],
+    int,
+    Dict[int, int],
+    Dict[int, int],
+]:
+    """
+    Resolve *only current UNKNOWN cells* using the previous trusted state.
+
+    History is never copied wholesale. For a previous COLOR, current targeted
+    visual evidence must still say PRESENT/EMPTY, or temporal old-color body
+    loss must prove COLOR->EMPTY. Otherwise the cell stays UNKNOWN.
+    """
+    grid = current_grid.copy()
+    evidence = dict(evidence_by_cell)
+    history_resolved = 0
+    history_by_color: Dict[int, int] = defaultdict(int)
+    temporal_empty_by_color: Dict[int, int] = defaultdict(int)
+
+    h, w = image_rgb.shape[:2]
+    unknown_positions = np.argwhere(current_grid == UNKNOWN)
+    for rr, cc in unknown_positions:
+        r, c = int(rr), int(cc)
+        old = int(previous_grid[r, c])
+
+        if old == UNKNOWN:
+            continue
+        if old == EMPTY:
+            # The trusted invariant EMPTY -> COLOR is impossible. The current
+            # frame did not contradict it (it was UNKNOWN), so history may
+            # resolve this uncertainty without inventing a new spatial change.
+            grid[r, c] = EMPTY
+            evidence[(r, c)] += "|history:empty-invariant"
+            history_resolved += 1
+            continue
+        if old <= 0 or old > len(palette):
+            continue
+
+        cx, cy = _grid_cell_center(r, c, w, h)
+        covered = ui_covered(cx, cy, w, h)
+        state, old_cov, bg_cov, bg_zones = _current_cell_visual_state(
+            image_rgb,
+            r,
+            c,
+            old,
+            palette,
+            background_rgb,
+            covered_by_fixed_ui=covered,
+        )
+        if state == "PRESENT":
+            grid[r, c] = old
+            evidence[(r, c)] += (
+                f"|history-targeted:present:{ctag(old)}:old_cov={old_cov:.3f}"
+            )
+            history_resolved += 1
+            history_by_color[old] += 1
+            continue
+        if state == "EMPTY":
+            grid[r, c] = EMPTY
+            evidence[(r, c)] += (
+                f"|history-targeted:empty:bg_cov={bg_cov:.3f},bg_zones={bg_zones}"
+            )
+            history_resolved += 1
+            history_by_color[old] += 1
+            continue
+
+        if previous_frame_rgb is None:
+            continue
+
+        temporal = _cell_disappearance_evidence(
+            previous_frame_rgb,
+            image_rgb,
+            current_grid_rgb,
+            previous_grid_rgb,
+            r,
+            c,
+            old,
+            palette,
+            background_rgb,
+        )
+        if not _temporal_old_color_disappeared(
+            temporal,
+            covered_by_fixed_ui=covered,
+        ):
+            continue
+
+        grid[r, c] = EMPTY
+        evidence[(r, c)] += (
+            "|history-temporal:empty:"
+            f"loss={temporal.loss_ratio:.3f},change={temporal.change_ratio:.3f},"
+            f"stable={temporal.stable_ratio:.3f},zones={temporal.zone_support}"
+        )
+        history_resolved += 1
+        history_by_color[old] += 1
+        temporal_empty_by_color[old] += 1
+
+    return (
+        grid,
+        evidence,
+        history_resolved,
+        dict(sorted(history_by_color.items())),
+        dict(sorted(temporal_empty_by_color.items())),
+    )
+
+
+def _visual_removals_by_color(
+    previous_grid: Optional[np.ndarray],
+    current_grid: np.ndarray,
+) -> Dict[int, int]:
+    if previous_grid is None:
+        return {}
+    removed: Dict[int, int] = defaultdict(int)
+    for rr, cc in np.argwhere((previous_grid > 0) & (current_grid == EMPTY)):
+        old = int(previous_grid[int(rr), int(cc)])
+        removed[old] += 1
+    return dict(sorted(removed.items()))
+
+
+def _capacity_audit_only(
+    consumed_by_color: Optional[Dict[int, int]],
+    visual_removed_by_color: Dict[int, int],
+) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, int]]:
+    """Compare quantities only. This function has no grid argument to mutate."""
+    if consumed_by_color is None:
+        return {}, {}, {}
+
+    expected = {
+        int(color): int(count)
+        for color, count in consumed_by_color.items()
+        if int(color) > 0 and int(count) > 0
+    }
+    remaining: Dict[int, int] = {}
+    excess: Dict[int, int] = {}
+    for color in sorted(set(expected) | set(visual_removed_by_color)):
+        expected_n = int(expected.get(color, 0))
+        visual_n = int(visual_removed_by_color.get(color, 0))
+        if visual_n < expected_n:
+            remaining[color] = expected_n - visual_n
+        elif visual_n > expected_n:
+            excess[color] = visual_n - expected_n
+    return dict(sorted(expected.items())), remaining, excess
+
+
+def observe_board(
+    image_rgb: np.ndarray,
+    palette: np.ndarray,
+    previous_trusted_grid: Optional[np.ndarray] = None,
+    *,
+    previous_trusted_frame_rgb: Optional[np.ndarray] = None,
+    previous_trusted_grid_rgb: Optional[np.ndarray] = None,
+    consumed_by_color: Optional[Dict[int, int]] = None,
+) -> ObservedBoard:
+    """
+    Build one fresh board from the current stable frame.
+
+    Authority order:
+      1. current-frame COLOR / EMPTY / UNKNOWN classification for all 1976 cells;
+      2. previous trusted state only for cells that are still UNKNOWN and for
+         forbidden-transition validation;
+      3. capacity conservation only as a quantity audit after spatial output.
+
+    In particular this function never starts from ``previous_trusted_grid.copy()``
+    and never uses a quantity budget to select coordinates.
+    """
+    image_rgb = np.asarray(image_rgb, dtype=np.float32)
+    palette = np.asarray(palette, dtype=np.float32)
+    background_rgb = _fallback_background_rgb(image_rgb)
+    current_grid_rgb = sample_grid_rgb_snapshot(image_rgb)
+
+    reasons: List[str] = []
+    warnings: List[str] = []
+
+    previous_grid: Optional[np.ndarray] = None
+    if previous_trusted_grid is not None:
+        candidate = np.asarray(previous_trusted_grid)
+        if candidate.shape != (GRID_ROWS, GRID_COLS):
+            reasons.append(
+                "previous_trusted_grid_shape="
+                f"{candidate.shape}, expected={(GRID_ROWS, GRID_COLS)}"
+            )
+        else:
+            previous_grid = candidate.astype(np.int16, copy=False)
+
+    previous_grid_rgb: Optional[np.ndarray] = None
+    previous_grid_rgb_available = False
+    if previous_trusted_grid_rgb is not None:
+        candidate_rgb = np.asarray(previous_trusted_grid_rgb)
+        if candidate_rgb.shape == (GRID_ROWS, GRID_COLS, 3):
+            previous_grid_rgb = candidate_rgb.astype(np.float32, copy=False)
+            previous_grid_rgb_available = True
+        else:
+            warnings.append(
+                "previous_trusted_grid_rgb_shape="
+                f"{candidate_rgb.shape}, ignored"
+            )
+
+    previous_frame_rgb: Optional[np.ndarray] = None
+    previous_frame_available = False
+    if previous_trusted_frame_rgb is not None:
+        candidate_frame = np.asarray(previous_trusted_frame_rgb)
+        if candidate_frame.shape == image_rgb.shape:
+            previous_frame_rgb = candidate_frame.astype(np.float32, copy=False)
+            previous_frame_available = True
+        else:
+            warnings.append(
+                "previous_trusted_frame_shape="
+                f"{candidate_frame.shape}, current={image_rgb.shape}, ignored"
+            )
+
+    if background_rgb is None:
+        reasons.append("current_frame_background_unavailable")
+
+    # PRIMARY AUTHORITY: fresh current-frame classification, never prev.copy().
+    direct_grid, evidence = _classify_current_frame_grid(
+        image_rgb,
+        palette,
+        background_rgb,
+    )
+
+    conflicts: List[Tuple[int, int, int, int]] = []
+    if previous_grid is not None:
+        conflicts = _direct_transition_conflicts(previous_grid, direct_grid)
+        for r, c, old, cur in conflicts:
+            reasons.append(
+                f"forbidden_transition R{r + 1:02d}C{c + 1:02d}:"
+                f"{ctag(old) if old > 0 else 'EMPTY'}->{ctag(cur)}"
+            )
+
+    final_grid = direct_grid
+    history_resolved = 0
+    history_by_color: Dict[int, int] = {}
+    temporal_empty_by_color: Dict[int, int] = {}
+    if previous_grid is not None:
+        (
+            final_grid,
+            evidence,
+            history_resolved,
+            history_by_color,
+            temporal_empty_by_color,
+        ) = _resolve_unknown_from_history(
+            direct_grid,
+            evidence,
+            image_rgb,
+            palette,
+            background_rgb,
+            previous_grid,
+            current_grid_rgb,
+            previous_grid_rgb,
+            previous_frame_rgb,
+        )
+
+    visual_removed = _visual_removals_by_color(previous_grid, final_grid)
+
+    direct_empty_by_color: Dict[int, int] = defaultdict(int)
+    if previous_grid is not None:
+        for rr, cc in np.argwhere((previous_grid > 0) & (direct_grid == EMPTY)):
+            old = int(previous_grid[int(rr), int(cc)])
+            direct_empty_by_color[old] += 1
+
+    expected, remaining, excess = _capacity_audit_only(
+        consumed_by_color,
+        visual_removed,
+    )
+    if remaining:
+        reasons.append(
+            "capacity_remaining="
+            + ",".join(f"{ctag(c)}:{n}" for c, n in sorted(remaining.items()))
+        )
+    if excess:
+        reasons.append(
+            "capacity_excess="
+            + ",".join(f"{ctag(c)}:{n}" for c, n in sorted(excess.items()))
+        )
+
+    unknown_cells = int(np.count_nonzero(final_grid == UNKNOWN))
+    if unknown_cells:
+        warnings.append(f"unresolved_unknown_cells={unknown_cells}")
+
+    health = ObservationHealth(
+        trusted=not reasons,
+        reasons=reasons,
+        warnings=warnings,
+        unknown_cells=unknown_cells,
+        transition_conflicts=conflicts,
+        capacity_remaining_by_color=remaining,
+        capacity_excess_by_color=excess,
+    )
+
+    return ObservedBoard(
+        grid=final_grid,
+        health=health,
+        evidence_by_cell=evidence,
+        background_rgb=background_rgb,
+        grid_rgb_snapshot=current_grid_rgb,
+        current_color_cells=int(np.count_nonzero(final_grid > 0)),
+        current_empty_cells=int(np.count_nonzero(final_grid == EMPTY)),
+        current_unknown_cells=unknown_cells,
+        history_resolved_cells=int(history_resolved),
+        temporal_resolved_empty_cells=int(sum(temporal_empty_by_color.values())),
+        removed_cells=int(sum(visual_removed.values())),
+        visual_removed_by_color=visual_removed,
+        direct_empty_by_color=dict(sorted(direct_empty_by_color.items())),
+        temporal_empty_by_color=temporal_empty_by_color,
+        history_resolved_by_color=history_by_color,
+        capacity_expected_by_color=expected,
+        previous_grid_rgb_available=previous_grid_rgb_available,
+        previous_frame_available=previous_frame_available,
+    )
+
+
+def observed_board_to_causal_update(observation: ObservedBoard) -> CausalBoardUpdate:
+    """
+    Transitional adapter for existing AnalysisResult/report fields.
+
+    REMOVE in Issue 004/006 after consumers use ObservedBoard/ObservationHealth
+    directly. It mirrors diagnostics only and never changes ``observation.grid``.
+    """
+    return CausalBoardUpdate(
+        grid=observation.grid,
+        removed=observation.removed_cells,
+        expected_by_color=dict(observation.capacity_expected_by_color),
+        confirmed_by_color=dict(observation.visual_removed_by_color),
+        remaining_by_color=dict(observation.health.capacity_remaining_by_color),
+        excess_by_color=dict(observation.health.capacity_excess_by_color),
+        invalid_reason="; ".join(observation.health.reasons),
+        checked_cells=GRID_ROWS * GRID_COLS,
+        temporal_confirmed_by_color=dict(observation.temporal_empty_by_color),
+        background_confirmed_by_color=dict(observation.direct_empty_by_color),
+        ambiguous_changed_by_color={},
+        temporal_change_threshold=_RECOG_TEMPORAL_CHANGE_DIST,
+        temporal_snapshot_available=observation.previous_grid_rgb_available,
+        patch_confirmed_by_color=dict(observation.temporal_empty_by_color),
+        patch_coverage_drop_threshold=_CAUSAL_PATCH_COVERAGE_DROP,
+        patch_previous_frame_available=observation.previous_frame_available,
+        strong_nonfrontier_confirmed_by_color={},
+        ui_unknown_confirmed_by_color={},
+    )
 
 
 def update_grid_causal(

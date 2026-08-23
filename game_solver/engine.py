@@ -14,8 +14,8 @@ from .adb import (
     adb_capture_bgr, adb_screencap, adb_tap, save_bgr, shot_stamp,
 )
 from .board import (
-    CausalBoardUpdate, ctag, initial_grid, learn_palette,
-    reachable_summary, sample_grid_rgb_snapshot, update_grid, update_grid_causal,
+    CausalBoardUpdate, ObservedBoard, ctag, learn_palette, observe_board,
+    observed_board_to_causal_update, reachable_summary,
 )
 from .config import FRONT_Y_N, UNKNOWN
 from .display import ClickMark, SolverDisplay
@@ -781,6 +781,69 @@ def _format_causal_board_update(
     return "\n".join(lines)
 
 
+def _format_observed_board_observation(observation: ObservedBoard) -> str:
+    health = observation.health
+    lines = [
+        "[OBSERVED_BOARD]",
+        "  spatial authority: current stable frame first; history resolves current UNKNOWN only",
+        (
+            f"  cells: COLOR={observation.current_color_cells}, "
+            f"EMPTY={observation.current_empty_cells}, "
+            f"UNKNOWN={observation.current_unknown_cells}"
+        ),
+        (
+            f"  history_resolved={observation.history_resolved_cells}, "
+            f"temporal_empty={observation.temporal_resolved_empty_cells}, "
+            f"visual_removed={observation.removed_cells}"
+        ),
+        f"  trusted={'yes' if health.trusted else 'no'}",
+    ]
+    if health.reasons:
+        lines.append("  reasons: " + "；".join(health.reasons))
+    if health.warnings:
+        lines.append("  warnings: " + "；".join(health.warnings))
+    if observation.capacity_expected_by_color:
+        lines.append(
+            "  capacity audit expected: "
+            + ", ".join(
+                f"{ctag(c)}={n}"
+                for c, n in observation.capacity_expected_by_color.items()
+            )
+        )
+    if observation.visual_removed_by_color:
+        lines.append(
+            "  visual removals: "
+            + ", ".join(
+                f"{ctag(c)}={n}"
+                for c, n in observation.visual_removed_by_color.items()
+            )
+        )
+    if health.transition_conflicts:
+        lines.append(
+            "  forbidden transitions: "
+            + ", ".join(
+                f"R{r + 1:02d}C{c + 1:02d}:"
+                f"{ctag(old) if old > 0 else 'EMPTY'}->{ctag(cur)}"
+                for r, c, old, cur in health.transition_conflicts
+            )
+        )
+    return "\n".join(lines)
+
+
+def _observed_board_allows_planning(
+    observation: Optional[ObservedBoard],
+    board_update_status: str,
+    causal_input_invalid: str,
+) -> bool:
+    """Defense in depth: an untrusted ObservedBoard never enters the planner."""
+    return bool(
+        observation is not None
+        and observation.health.trusted
+        and board_update_status == "ok"
+        and not str(causal_input_invalid or "").strip()
+    )
+
+
 def analyze_image(
     image_path: Path,
     state_path: Path,
@@ -814,7 +877,6 @@ def analyze_image(
         image_bgr,
         cv2.COLOR_BGR2RGB,
     ).astype(np.float32)
-    current_grid_rgb = sample_grid_rgb_snapshot(image_rgb)
 
     front_centers = detect_front_centers(image_bgr)
 
@@ -839,6 +901,7 @@ def analyze_image(
 
     removed_since_last: Optional[int]
     causal_update: Optional[CausalBoardUpdate] = None
+    board_observation: Optional[ObservedBoard] = None
     causal_input_invalid = ""
     board_update_status = "ok"
     new_state = reset or not state_path.exists()
@@ -866,7 +929,12 @@ def analyze_image(
             read_numbers=True,
         )
 
-        grid = initial_grid(image_rgb, palette)
+        board_observation = observe_board(image_rgb, palette)
+        grid = board_observation.grid
+        current_grid_rgb = board_observation.grid_rgb_snapshot
+        if not board_observation.health.trusted:
+            board_update_status = "incomplete"
+
         turn = 0
         removed_since_last = None
         parking_empty_ref = parking_roi(image_bgr)
@@ -893,7 +961,6 @@ def analyze_image(
             front_centers,
         )
 
-        # 车辆状态先于棋盘因果更新读取，因为“下一稳定停车剩余”是容量守恒右端。
         front, nxt = detect_front_and_next(
             image_rgb,
             image_bgr,
@@ -909,7 +976,8 @@ def analyze_image(
         )
 
         expected_consumed: Dict[int, int] = {}
-        if flow_capacity_before_by_color is not None:
+        has_causal_context = flow_capacity_before_by_color is not None
+        if has_causal_context:
             expected_consumed, causal_input_invalid = (
                 _actual_consumed_from_capacity_delta(
                     flow_capacity_before_by_color,
@@ -917,35 +985,33 @@ def analyze_image(
                 )
             )
 
-        # unresolved consumption 只属于“上一动作 -> 当前稳定截图”这一次转移。
-        # 若无法完整定位，实验模式记录异常并提交保守 grid；未落实数量不跨动作 carry。
-        has_causal_context = flow_capacity_before_by_color is not None
+        # Issue 003: spatial state is produced even if the capacity side-channel
+        # is invalid. Invalid quantity data is never allowed to mutate positions.
+        board_observation = observe_board(
+            image_rgb,
+            palette,
+            prev_grid,
+            previous_trusted_frame_rgb=prev_grid_image_rgb,
+            previous_trusted_grid_rgb=prev_grid_rgb,
+            consumed_by_color=(
+                expected_consumed
+                if has_causal_context and not causal_input_invalid
+                else None
+            ),
+        )
+        grid = board_observation.grid
+        current_grid_rgb = board_observation.grid_rgb_snapshot
+        removed_since_last = board_observation.removed_cells
+
+        if has_causal_context and not causal_input_invalid:
+            # Transitional diagnostics adapter only; the adapter is not a second
+            # board authority and must be removed by Issue 004/006.
+            causal_update = observed_board_to_causal_update(board_observation)
 
         if causal_input_invalid:
-            # 容量守恒本身失败：不能拿任何数量修改棋盘。
-            grid = prev_grid.copy()
-            removed_since_last = 0
             board_update_status = "causal_invalid"
-        elif has_causal_context:
-            causal_update = update_grid_causal(
-                prev_grid,
-                image_rgb,
-                palette,
-                expected_consumed,
-                prev_grid_rgb=prev_grid_rgb,
-                prev_image_rgb=prev_grid_image_rgb,
-            )
-            grid = causal_update.grid
-            removed_since_last = causal_update.removed
-            if not causal_update.complete:
-                board_update_status = "incomplete"
-        else:
-            # 单图/人工兼容路径。
-            grid, removed_since_last = update_grid(
-                prev_grid,
-                image_rgb,
-                palette,
-            )
+        elif not board_observation.health.trusted:
+            board_update_status = "incomplete"
 
     occupied_slots = len(parked)
 
@@ -1023,28 +1089,40 @@ def analyze_image(
         and free_slots < 3
     )
 
-    candidates = evaluate_candidates(
-        strategy_grid,
-        front,
-        nxt,
-        parked,
-        slots,
-        occupied_slots,
-        include_queue_lookahead=not local_force_single,
+    observation_can_plan = _observed_board_allows_planning(
+        board_observation,
+        board_update_status,
+        causal_input_invalid,
     )
 
-    if local_force_single:
-        two_step_plan = None
-    else:
-        two_step_plan = choose_two_step_plan(
+    if observation_can_plan:
+        candidates = evaluate_candidates(
             strategy_grid,
             front,
             nxt,
             parked,
             slots,
             occupied_slots,
-            candidates,
+            include_queue_lookahead=not local_force_single,
         )
+
+        if local_force_single:
+            two_step_plan = None
+        else:
+            two_step_plan = choose_two_step_plan(
+                strategy_grid,
+                front,
+                nxt,
+                parked,
+                slots,
+                occupied_slots,
+                candidates,
+            )
+    else:
+        # Issue 002 + 003: do not even execute planner ranking on an untrusted
+        # spatial observation. The auto runner will retry / NO_CLICK_UNTRUSTED.
+        candidates = []
+        two_step_plan = None
 
     report = format_report(
         grid,
@@ -1058,6 +1136,9 @@ def analyze_image(
         occupied_slots,
         new_colors_added,
     )
+
+    if board_observation is not None:
+        report += "\n\n" + _format_observed_board_observation(board_observation)
 
     if causal_update is not None:
         report += "\n\n" + _format_causal_board_update(causal_update)
@@ -1093,8 +1174,9 @@ def analyze_image(
         report += (
             "\n\n!!! BOARD_UPDATE_INCOMPLETE / EXPERIMENT_WARNING !!!\n"
             "容量守恒审计值与视觉空间识别不一致。"
-            "实验模式会提交当前已确认的保守棋盘并继续单步运行；"
-            "不按容量猜测格子位置；差异只写入日志，不跨动作 carry，也不阻止下一次点击。"
+            "默认严格观测门会拒绝提交并保持 NO_CLICK_UNTRUSTED；"
+            "只有显式 --experimental-continue 才允许继续诊断运行。"
+            "容量差异只做审计，绝不用于选择或补齐格子位置。"
             f"\n问题颜色: "
             f"{', '.join(ctag(c) for c in problem_colors) or '未知'}"
         )
@@ -1137,13 +1219,19 @@ def analyze_image(
     else:
         best = best_valid_candidate(candidates)
 
-    # v5.9：
-    # analyze_image 在观测重试期间必须是“只读 committed state”的纯分析。
-    # 所有 retry 都从同一个 solver_state 重新计算，只有调用方最终选定一次
-    # observation 后才 commit。单图模式仍使用默认 commit_state=True。
+    # Issue 003: a direct analyze_image(commit_state=True) call must not persist
+    # an untrusted spatial observation either. Auto retry still passes
+    # commit_state=False and commits the selected trusted result externally.
     turn += 1
-    state_saved = bool(commit_state)
-    if commit_state:
+    state_saved = bool(
+        commit_state
+        and _observed_board_allows_planning(
+            board_observation,
+            board_update_status,
+            causal_input_invalid,
+        )
+    )
+    if state_saved:
         save_state(
             state_path,
             palette,
@@ -1192,6 +1280,9 @@ def analyze_image(
         guarantee_broken=guarantee_broken,
         guarantee_expected_upper=previous_prediction_upper,
         state_saved=state_saved,
+        observation_health=(
+            board_observation.health if board_observation is not None else None
+        ),
         grid_rgb_snapshot=current_grid_rgb,
     )
 
@@ -1588,6 +1679,14 @@ def _observation_trust(
     ).strip()
     if causal_invalid:
         reasons.append(f"causal_input_invalid={causal_invalid}")
+
+    health = getattr(result, "observation_health", None)
+    if health is not None and not bool(getattr(health, "trusted", False)):
+        health_reasons = list(getattr(health, "reasons", ()) or ())
+        if health_reasons:
+            reasons.extend(f"observed_board={reason}" for reason in health_reasons)
+        else:
+            reasons.append("observed_board=untrusted")
 
     return (len(reasons) == 0), tuple(reasons)
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -76,6 +76,19 @@ class FrontNumberCacheEntry:
 
 
 @dataclass
+class ObservationHealth:
+    """Structured trust result for one current stable-frame board observation."""
+
+    trusted: bool
+    reasons: List[str] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+    unknown_cells: int = 0
+    transition_conflicts: List[Tuple[int, int, int, int]] = field(default_factory=list)
+    capacity_remaining_by_color: Dict[int, int] = field(default_factory=dict)
+    capacity_excess_by_color: Dict[int, int] = field(default_factory=dict)
+
+
+@dataclass
 class AnalysisResult:
     report: str
     palette: np.ndarray
@@ -104,6 +117,9 @@ class AnalysisResult:
     guarantee_broken: bool = False
     guarantee_expected_upper: Optional[int] = None
     state_saved: bool = True
+
+    # Issue 003: current-frame board authority and structured trust diagnostics.
+    observation_health: Optional[ObservationHealth] = None
 
     # v5.9：当前稳定截图的 52x38x3 格子 RGB 快照。
     # 自动重试结束后只在最终 commit 时写入 solver_state。
