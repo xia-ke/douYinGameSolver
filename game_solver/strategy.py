@@ -22,6 +22,13 @@ _TWO_STEP_MIN_FREE_SLOTS = 3
 # logical cell step, the prediction abstains instead of inventing a tie-break.
 _NEAREST_MIN_DISTANCE_MARGIN_REF = 0.35 * min(X_STEP_REF, Y_STEP_REF)
 
+# Empty utility is reserved for the trusted single-column fast path. That path
+# still builds the authoritative hard-feasibility result, but deliberately skips
+# all work whose only purpose is comparing multiple legal choices.
+_SINGLE_COLUMN_FAST_PATH_REASON = (
+    "single-column fast path: ranking/queue-lookahead/nearest tie-break skipped"
+)
+
 
 @dataclass
 class _FlowSimulation:
@@ -327,6 +334,8 @@ def simulate_flow_closure(
     parked: Sequence[Car],
     action_cars: Sequence[Car],
     slots: int,
+    *,
+    include_nearest_prediction: bool = True,
 ) -> _FlowSimulation:
     """
     对真实游戏规则做保守的“自动分流闭包”：
@@ -455,13 +464,16 @@ def simulate_flow_closure(
     final_occupied_upper = max(0, total_cars_after_clicks - guaranteed_total)
     stable_safe = final_occupied_upper < slots
 
-    nearest_exposed, nearest_removed = _nearest_partial_exposure_prediction(
-        sim,
-        parked,
-        action_cars,
-        dict(consumed),
-        dict(cleared),
-    )
+    if include_nearest_prediction:
+        nearest_exposed, nearest_removed = _nearest_partial_exposure_prediction(
+            sim,
+            parked,
+            action_cars,
+            dict(consumed),
+            dict(cleared),
+        )
+    else:
+        nearest_exposed, nearest_removed = {}, {}
 
     return _FlowSimulation(
         grid=sim,
@@ -568,6 +580,8 @@ def _build_candidate(
     parked: Sequence[Car],
     slots: int,
     useful_colors: Sequence[int],
+    *,
+    compute_selection_utility: bool = True,
 ) -> Candidate:
     assert car.color is not None
     assert car.remain is not None
@@ -578,7 +592,16 @@ def _build_candidate(
     reachable, _ = reachable_summary(grid)
     r = int(reachable.get(color, 0))
 
-    sim = simulate_flow_closure(grid, parked, [car], slots)
+    # Hard feasibility always uses the same deterministic closure. The trusted
+    # single-column fast path only disables the optional nearest prediction that
+    # exists solely for final multi-candidate tie-breaking.
+    sim = simulate_flow_closure(
+        grid,
+        parked,
+        [car],
+        slots,
+        include_nearest_prediction=compute_selection_utility,
+    )
     parked_same = parked_remainders_by_color(parked).get(color, [])
     total_supply_for_color = int(sim.consumed_by_color.get(color, 0))
     self_clear = _specific_action_car_completion_guaranteed(
@@ -594,19 +617,31 @@ def _build_candidate(
 
     next_color = next_car.color if next_car is not None else None
     next_capacity = next_car.remain if next_car is not None else None
-    next_new = (
-        int(sim.exposed_by_color.get(next_color, 0))
-        if next_color is not None
-        else 0
-    )
-    useful_new = _useful_exposed_cells(sim.exposed_by_color, useful_colors)
 
-    utility = _utility_key(
-        sim,
-        useful_colors=useful_colors,
-        queue_progress=1,
-        reachable_hint=r,
-    )
+    if compute_selection_utility:
+        next_new = (
+            int(sim.exposed_by_color.get(next_color, 0))
+            if next_color is not None
+            else 0
+        )
+        useful_new = _useful_exposed_cells(sim.exposed_by_color, useful_colors)
+        utility = _utility_key(
+            sim,
+            useful_colors=useful_colors,
+            queue_progress=1,
+            reachable_hint=r,
+        )
+        utility_reason = _utility_reason(utility)
+        heuristic_tiebreak = tuple(utility[5:])
+    else:
+        # There is no selection problem with one legal queue column. Preserve
+        # Candidate execution diagnostics without calculating ranking statistics
+        # or nearest-cell tie-break data.
+        next_new = 0
+        useful_new = 0
+        utility = ()
+        utility_reason = _SINGLE_COLUMN_FAST_PATH_REASON
+        heuristic_tiebreak = ()
     rejected = not sim.stable_safe
     reason = ""
     if rejected:
@@ -634,14 +669,21 @@ def _build_candidate(
         rejected=rejected,
         reject_reason=reason,
         utility=utility,
-        utility_reason=_utility_reason(utility),
+        utility_reason=utility_reason,
         queue_progress=1,
-        heuristic_tiebreak=tuple(utility[5:]),
+        heuristic_tiebreak=heuristic_tiebreak,
         next_color=next_color,
         next_capacity=next_capacity,
         flow_cleared_cells=sum(sim.cleared_by_color.values()),
         flow_final_occupied_upper=sim.final_occupied_upper,
         flow_exact=sim.exact_grid,
+    )
+
+
+def _is_single_column_fast_candidate(candidate: Candidate) -> bool:
+    return (
+        candidate.utility == ()
+        and candidate.utility_reason == _SINGLE_COLUMN_FAST_PATH_REASON
     )
 
 
@@ -654,11 +696,41 @@ def evaluate_candidates(
     occupied_slots: int,
     *,
     include_queue_lookahead: bool = True,
+    detected_queue_columns: Optional[int] = None,
 ) -> List[Candidate]:
     del occupied_slots  # stable feasibility is already encoded by flow closure.
 
     next_by_col = {c.column: c for c in nxt if c.column is not None}
     front_by_col = {c.column: c for c in front if c.column is not None}
+
+    # The engine passes the raw count from detect_front_centers(), so the fast
+    # path is based on the dynamic queue detector rather than len(candidates).
+    # include_queue_lookahead=True is the trusted normal-planning contract;
+    # explicit untrusted continuation remains on the existing one-step path.
+    if include_queue_lookahead and detected_queue_columns == 1:
+        buildable_front = [
+            car
+            for car in front
+            if (
+                car.column is not None
+                and car.color is not None
+                and car.remain is not None
+            )
+        ]
+        if len(buildable_front) != 1:
+            return []
+        car = buildable_front[0]
+        return [
+            _build_candidate(
+                grid,
+                car,
+                next_by_col.get(car.column),
+                parked,
+                slots,
+                (),
+                compute_selection_utility=False,
+            )
+        ]
 
     active_front_colors = {c.color for c in front if c.color is not None}
     parked_colors = {c.color for c in parked if c.color is not None}
@@ -767,6 +839,12 @@ def choose_two_step_plan(
     candidates: Sequence[Candidate],
 ) -> Optional[TwoStepPlan]:
     """Choose a stable-safe pair only when ordered rule utility clearly improves."""
+    # Single-column fast path is intentionally one current-front action. Its
+    # hard-feasibility result is already known; do not enumerate the preview row
+    # or compare any two-step combination.
+    if len(candidates) == 1 and _is_single_column_fast_candidate(candidates[0]):
+        return None
+
     free_slots = slots - occupied_slots
     if free_slots < _TWO_STEP_MIN_FREE_SLOTS:
         return None
@@ -903,7 +981,11 @@ def choose_two_step_plan(
 
 
 def best_valid_candidate(candidates: Sequence[Candidate]) -> Optional[Candidate]:
-    """Return the lexicographically best stable-safe candidate, or None."""
+    """Return the stable-safe choice; rank only when a real choice exists."""
+    if len(candidates) == 1 and _is_single_column_fast_candidate(candidates[0]):
+        candidate = candidates[0]
+        return None if candidate.rejected else candidate
+
     valid = [candidate for candidate in candidates if not candidate.rejected]
     if not valid:
         return None

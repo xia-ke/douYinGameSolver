@@ -179,12 +179,17 @@ def _plan_current_observation(
     slots: int,
     occupied_slots: int,
     *,
+    detected_queue_columns: Optional[int] = None,
     experimental_continue: bool,
 ):
     """Small execution policy: trusted=normal plan; untrusted=none, or one-step experiment."""
     trusted = bool(observation.health.trusted)
     if not trusted and not experimental_continue:
         return [], None
+
+    evaluate_kwargs = {"include_queue_lookahead": trusted}
+    if detected_queue_columns is not None:
+        evaluate_kwargs["detected_queue_columns"] = detected_queue_columns
 
     candidates = evaluate_candidates(
         grid,
@@ -193,8 +198,7 @@ def _plan_current_observation(
         parked,
         slots,
         occupied_slots,
-        # An explicit untrusted experiment is intentionally one-step only.
-        include_queue_lookahead=trusted,
+        **evaluate_kwargs,
     )
     if not trusted:
         return candidates, None
@@ -396,6 +400,7 @@ def analyze_image(
         parked,
         slots,
         occupied_slots,
+        detected_queue_columns=len(front_centers),
         experimental_continue=bool(experimental_continue),
     )
 
