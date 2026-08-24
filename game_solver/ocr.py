@@ -25,8 +25,17 @@ _GAME_DIGIT_B64 = {
     8: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAP/wAAD/8AAD//4AD///AB///4Af///AP///wD///8A/4D/gP8Af4D/AH+A/wB/gP8AfwD/AH8A/4D/AH/D/wB///4AP//8AB//+AAf//wAP//+AH///wD/4/8A/4D/g/8Af4P+AH/D/gB/w/4Af8P+AH/D/wB/w/+A/8P///+A////gP///wB///8AP//+AA//+AAD/8AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     9: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAH/wAAB/8AAB//4AB///AA///4Af///AH///wD///+A/8D/gP+Af8P/AH/D/wA/w/4AP8P+AD/D/gA/w/8AP8P/AH/A/4D/wP///8D////Af///wD///8Af///AD///wAD8/4AAAH+AAAB/gAAA/4AAAf+AAA//AAf//wAP//4AD//8AA//+AAP//AAD//AAA//AAAH4AAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
 }
+# Additional real-game glyph variants. Keep the original canonical template;
+# variants are max-pooled per digit so an added sample cannot remove support
+# for an older rendering of the same glyph.
+_GAME_DIGIT_VARIANTS_B64 = {
+    6: (
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAB8AAAAfAAAB/4AAD/+AAD//gAB//4AA//+AAf//gAP//wAD/+AAB/4AAAf8AAAP+AAAD/gAAA/4AAAP//8AP///wD///+A////wP///+D////g////4P/gP/D/wB/w/4Af8P+AH/D/gB/w/4Af8P/AH/D/wB/wP+A/4D///+A////gH///wA///4AH//8AA//+AAB/+AAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    ),
+}
 
 _GAME_BANK_CACHE: Optional[np.ndarray] = None
+_GAME_TEMPLATE_DIGITS_CACHE: Optional[np.ndarray] = None
 _GAME_HOLES_CACHE: Optional[np.ndarray] = None
 
 
@@ -109,25 +118,51 @@ def _hole_count(mask: np.ndarray) -> int:
     return holes
 
 
-def _game_bank() -> Tuple[np.ndarray, np.ndarray]:
-    global _GAME_BANK_CACHE, _GAME_HOLES_CACHE
-    if _GAME_BANK_CACHE is not None and _GAME_HOLES_CACHE is not None:
-        return _GAME_BANK_CACHE, _GAME_HOLES_CACHE
+def _game_bank() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    global _GAME_BANK_CACHE, _GAME_TEMPLATE_DIGITS_CACHE, _GAME_HOLES_CACHE
+    if (
+        _GAME_BANK_CACHE is not None
+        and _GAME_TEMPLATE_DIGITS_CACHE is not None
+        and _GAME_HOLES_CACHE is not None
+    ):
+        return (
+            _GAME_BANK_CACHE,
+            _GAME_TEMPLATE_DIGITS_CACHE,
+            _GAME_HOLES_CACHE,
+        )
 
     rows: List[np.ndarray] = []
+    template_digits: List[int] = []
     holes: List[int] = []
-    for digit in range(10):
+
+    def append_template(digit: int, encoded: str) -> None:
         packed = np.frombuffer(
-            base64.b64decode(_GAME_DIGIT_B64[digit]),
+            base64.b64decode(encoded),
             dtype=np.uint8,
         )
         bits = np.unpackbits(packed)[: 32 * 48].reshape(48, 32)
         rows.append(bits.astype(np.float32).reshape(-1))
+        template_digits.append(int(digit))
         holes.append(_hole_count(bits))
 
+    for digit in range(10):
+        append_template(digit, _GAME_DIGIT_B64[digit])
+
+    for digit, variants in sorted(_GAME_DIGIT_VARIANTS_B64.items()):
+        for encoded in variants:
+            append_template(int(digit), encoded)
+
     _GAME_BANK_CACHE = np.stack(rows, axis=0).astype(np.float32)
+    _GAME_TEMPLATE_DIGITS_CACHE = np.asarray(
+        template_digits,
+        dtype=np.int16,
+    )
     _GAME_HOLES_CACHE = np.asarray(holes, dtype=np.int16)
-    return _GAME_BANK_CACHE, _GAME_HOLES_CACHE
+    return (
+        _GAME_BANK_CACHE,
+        _GAME_TEMPLATE_DIGITS_CACHE,
+        _GAME_HOLES_CACHE,
+    )
 
 
 def _accept_digit(score: float, margin: float, profile: str) -> bool:
@@ -168,12 +203,14 @@ class GameDigitRecognizer:
             )
 
         v0 = normalized.astype(np.float32)
-        bank, template_holes = _game_bank()
+        bank, template_digits, template_holes = _game_bank()
         areas = bank.sum(axis=1)
-        best = np.full(10, -1e9, dtype=np.float32)
+        template_best = np.full(len(bank), -1e9, dtype=np.float32)
 
         # Real-game templates are already normalized from the same font. Only a
-        # ±1 px alignment tolerance is needed; there is no legacy classifier.
+        # ±1 px alignment tolerance is needed. Multiple real variants for one
+        # digit are max-pooled after alignment instead of replacing the older
+        # canonical rendering.
         for dy in (-1, 0, 1):
             for dx in (-1, 0, 1):
                 shifted = np.zeros_like(v0)
@@ -199,7 +236,13 @@ class GameDigitRecognizer:
                 scores = dice - 0.12 * np.abs(
                     template_holes.astype(np.float32) - float(hole_count)
                 )
-                best = np.maximum(best, scores)
+                template_best = np.maximum(template_best, scores)
+
+        best = np.full(10, -1e9, dtype=np.float32)
+        for digit in range(10):
+            matches = template_best[template_digits == digit]
+            if len(matches):
+                best[digit] = float(np.max(matches))
 
         ranked = np.argsort(best)[::-1]
         digit = int(ranked[0])
