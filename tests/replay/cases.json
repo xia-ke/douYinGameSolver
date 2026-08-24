@@ -17,14 +17,30 @@
       },
       "inputs": {
         "executed_action": [
-          {"color": "C01", "capacity": 40},
-          {"color": "C01", "capacity": 40}
+          {
+            "color": "C01",
+            "capacity": 40
+          },
+          {
+            "color": "C01",
+            "capacity": 40
+          }
         ]
       },
       "expected": {
-        "capacity": {"consumed_by_color": {"C01": 75}},
-        "board": {"removed_by_color": {"C01": 75}},
-        "parking": {"C01_remain": 5}
+        "capacity": {
+          "consumed_by_color": {
+            "C01": 75
+          }
+        },
+        "board": {
+          "removed_by_color": {
+            "C01": 75
+          }
+        },
+        "parking": {
+          "C01_remain": 5
+        }
       },
       "provenance": "Mission-First audit historical case from a real-device run.",
       "notes": "Two C01 cars with capacity 40 each; next stable parking C01 remain was 5.",
@@ -75,16 +91,16 @@
       },
       "provenance": "Mission-First audit historical ghost-cell case confirmed against the final real screenshot.",
       "notes": "These six C08 coordinates were logged as persistent color but were visually absent/gray in the real image.",
-      "pending_reason": "The real screenshot proving these cells were EMPTY is no longer available."
+      "pending_reason": "The real PNG is still missing. Project logs identify the final stable screenshot as solver_shots/analysis_20260822_213231_107.png. Nearby earlier frames include analysis_20260822_212526_788.png and analysis_20260822_212543_264.png. Do not promote until the real image artifact is recovered."
     },
     {
       "id": "unlock-three-column-game-screen",
       "subsystem": "unlock",
-      "status": "pending_fixture",
+      "status": "active",
       "kind": "frame",
       "runner": "unlock_game_screen",
       "artifacts": {
-        "stable_screenshot": null
+        "stable_screenshot": "tests/replay/fixtures/level16_c01_64_before.png"
       },
       "inputs": {
         "front_row_columns": 3
@@ -92,9 +108,8 @@
       "expected": {
         "is_game_screen": true
       },
-      "provenance": "Mission-First audit historical three-column level used by sixth-slot unlock detection.",
-      "notes": "A real three-column game screen must be accepted as a valid game screen.",
-      "pending_reason": "The historical three-column screenshot is unavailable. A future real three-column level should promote this case."
+      "provenance": "Historical three-column requirement promoted with a later real-device Level 16 stable screenshot preserved in the repository.",
+      "notes": "The original audit-era screenshot remains lost, but the replay workflow explicitly allows a later naturally occurring comparable real run. This fixture has exactly three front-row vehicle columns and exercises the same unlock game-screen detector contract."
     },
     {
       "id": "strategy-nearest-cell-routing",

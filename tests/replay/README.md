@@ -45,6 +45,8 @@ When a new real-device visual/rule failure appears:
 
 ## Historical policy
 
-The audit-era C01, C08, OCR-26, three-column, nearest-cell, and same-color low-remain screenshots were not preserved. Their registry entries therefore remain `pending_fixture`. Do not reconstruct, synthesize, or mark those lost pixel assertions as passed. A naturally occurring comparable real run can later promote the corresponding case.
+The audit-era C01, C08, OCR-26, nearest-cell, and same-color low-remain screenshots were not preserved. Those historical pixel assertions remain `pending_fixture`; do not reconstruct or synthesize them.
+
+The historical three-column game-screen requirement has now been promoted using a later naturally occurring real Level 16 three-column stable frame already preserved in `tests/replay/fixtures/level16_c01_64_before.png`, which is permitted by this workflow. A separate real Level 16 parking `16` frame is also preserved by `test_level16_parking_number_replay.py`.
 
 The confirmed same-color low-remain domain rule also has a separate deterministic rule-level test. That test protects the rule implementation but is not a substitute for the missing historical screenshot replay.

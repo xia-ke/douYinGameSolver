@@ -12,19 +12,29 @@ EXPECTED_HISTORICAL_CASES = {
     "strategy-same-color-low-remain-priority",
 }
 
+PROMOTED_REAL_CASES = {
+    "unlock-three-column-game-screen",
+}
+
 
 def test_manifest_registers_all_audit_historical_cases() -> None:
     cases = load_manifest()
     assert {case.case_id for case in cases} == EXPECTED_HISTORICAL_CASES
 
 
-def test_missing_historical_visual_evidence_is_explicitly_pending() -> None:
+def test_only_real_recovered_historical_cases_are_active() -> None:
     cases = load_manifest()
-    assert cases
+    active = {case.case_id for case in cases if case.is_active}
+    assert active == PROMOTED_REAL_CASES
+
     for case in cases:
-        assert case.status == "pending_fixture"
-        assert case.pending_reason
         assert case.expected
+        if case.case_id in PROMOTED_REAL_CASES:
+            assert case.status == "active"
+            assert not case.pending_reason
+        else:
+            assert case.status == "pending_fixture"
+            assert case.pending_reason
 
 
 def test_pending_cases_never_claim_nonexistent_artifacts() -> None:
