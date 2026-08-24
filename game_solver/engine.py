@@ -708,7 +708,21 @@ def _has_distinguishable_known_next(
     )
     if nxt is None:
         return False
-    return (nxt.color, nxt.remain) != (candidate.color, candidate.capacity)
+
+    # UNKNOWN is not a known difference. A next-row car is distinguishable
+    # only when at least one independently known attribute proves it differs
+    # from the clicked front car.
+    color_diff = bool(
+        nxt.color is not None
+        and candidate.color is not None
+        and nxt.color != candidate.color
+    )
+    number_diff = bool(
+        nxt.remain is not None
+        and candidate.capacity is not None
+        and nxt.remain != candidate.capacity
+    )
+    return bool(color_diff or number_diff)
 
 
 def _tap_proven_not_departed(

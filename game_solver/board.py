@@ -90,6 +90,14 @@ _RECOG_UI_EMPTY_MIN_BG_COVERAGE = 0.90
 _RECOG_UI_EMPTY_MIN_BG_ZONES = 8
 _RECOG_UI_EMPTY_MAX_OLD_COLOR_COVERAGE = 0.03
 
+# Fixed-UI cells may stay UNKNOWN even though the UI is translucent enough for
+# a real underlying block removal to create a large temporal pixel change.
+# These thresholds detect an anonymous UNKNOWN->EMPTY event from visual time
+# difference only. Capacity never selects the coordinate or its old color.
+_RECOG_OCCLUDED_CHANGE_PIXEL_DIST = 30.0
+_RECOG_OCCLUDED_CHANGE_MIN_RATIO = 0.38
+_RECOG_OCCLUDED_CHANGE_MIN_MEAN = 28.0
+
 # 当已存在 EMPTY 很少时，使用棋盘下缘和停车区之间的灰色游戏背景估计背景色。
 # 这些比例针对整个截图而不是棋盘网格；只作为首轮/极少 EMPTY 时的兜底。
 _BACKGROUND_FALLBACK_X1_N = 0.22
@@ -1344,6 +1352,115 @@ def _resolve_unknown_from_history(
     )
 
 
+def _resolve_occluded_unknown_temporal_empty(
+    current_grid: np.ndarray,
+    evidence_by_cell: Dict[Tuple[int, int], str],
+    previous_grid: np.ndarray,
+    previous_frame_rgb: Optional[np.ndarray],
+    current_frame_rgb: np.ndarray,
+) -> Tuple[
+    np.ndarray,
+    Dict[Tuple[int, int], str],
+    int,
+    List[Tuple[int, int]],
+]:
+    """
+    Resolve fixed-UI UNKNOWN cells that visually prove an underlying removal.
+
+    The fixed top UI is stable and partially translucent. If a logical cell was
+    UNKNOWN before and remains UNKNOWN now, but a large fraction of the same
+    inner-cell pixels changed between two stable frames, the underlying block
+    has disappeared even though its old palette color was never observable.
+
+    This is deliberately color-anonymous and uses no capacity information.
+    """
+    grid = current_grid.copy()
+    evidence = dict(evidence_by_cell)
+    coords: List[Tuple[int, int]] = []
+
+    if previous_frame_rgb is None:
+        return grid, evidence, 0, coords
+
+    h, w = current_frame_rgb.shape[:2]
+    for rr, cc in np.argwhere(
+        (previous_grid == UNKNOWN) & (current_grid == UNKNOWN)
+    ):
+        r, c = int(rr), int(cc)
+        cx, cy = _grid_cell_center(r, c, w, h)
+        if not ui_covered(cx, cy, w, h):
+            continue
+
+        before = _sample_grid_cell_inner_patch(previous_frame_rgb, r, c)
+        after = _sample_grid_cell_inner_patch(current_frame_rgb, r, c)
+        hh = min(before.shape[0], after.shape[0])
+        ww = min(before.shape[1], after.shape[1])
+        if hh <= 0 or ww <= 0:
+            continue
+
+        before = before[:hh, :ww]
+        after = after[:hh, :ww]
+        delta = np.linalg.norm(
+            after.astype(np.float32) - before.astype(np.float32),
+            axis=2,
+        )
+        changed_ratio = float(
+            np.mean(delta >= _RECOG_OCCLUDED_CHANGE_PIXEL_DIST)
+        )
+        mean_change = float(np.mean(delta))
+
+        if (
+            changed_ratio < _RECOG_OCCLUDED_CHANGE_MIN_RATIO
+            or mean_change < _RECOG_OCCLUDED_CHANGE_MIN_MEAN
+        ):
+            continue
+
+        grid[r, c] = EMPTY
+        evidence[(r, c)] = evidence.get((r, c), "") + (
+            "|ui-occluded-temporal:empty:"
+            f"change_ratio={changed_ratio:.3f},"
+            f"mean_change={mean_change:.1f}"
+        )
+        coords.append((r, c))
+
+    return grid, evidence, len(coords), coords
+
+
+def _capacity_audit_with_occluded_unknown(
+    consumed_by_color: Optional[Dict[int, int]],
+    visual_removed_by_color: Dict[int, int],
+    occluded_unknown_removed: int,
+) -> Tuple[
+    Dict[int, int],
+    Dict[int, int],
+    Dict[int, int],
+    Dict[int, int],
+]:
+    """
+    Quantity-only reconciliation for color-anonymous fixed-UI removals.
+
+    Spatial coordinates were already selected by independent temporal visual
+    evidence. Capacity is allowed only to verify that the anonymous removal
+    count exactly closes the total per-color quantity shortfall. It does not
+    assign an old color to any coordinate.
+    """
+    expected, remaining, excess = _capacity_audit_only(
+        consumed_by_color,
+        visual_removed_by_color,
+    )
+    explained: Dict[int, int] = {}
+
+    missing_total = int(sum(remaining.values()))
+    if (
+        remaining
+        and not excess
+        and int(occluded_unknown_removed) > 0
+        and missing_total == int(occluded_unknown_removed)
+    ):
+        explained = dict(remaining)
+        remaining = {}
+
+    return expected, remaining, excess, explained
+
 def _visual_removals_by_color(
     previous_grid: Optional[np.ndarray],
     current_grid: np.ndarray,
@@ -1536,6 +1653,26 @@ def observe_board(
             )
         temporal_empty_by_color = dict(sorted(temporal_empty_by_color.items()))
 
+    occluded_ui_temporal_empty = 0
+    if previous_grid is not None:
+        (
+            final_grid,
+            evidence,
+            occluded_ui_temporal_empty,
+            _occluded_ui_coords,
+        ) = _resolve_occluded_unknown_temporal_empty(
+            final_grid,
+            evidence,
+            previous_grid,
+            previous_frame_rgb,
+            image_rgb,
+        )
+        if occluded_ui_temporal_empty:
+            warnings.append(
+                "occluded_ui_temporal_empty="
+                f"{occluded_ui_temporal_empty}"
+            )
+
     visual_removed = _visual_removals_by_color(previous_grid, final_grid)
 
     direct_empty_by_color: Dict[int, int] = defaultdict(int)
@@ -1548,10 +1685,24 @@ def observe_board(
             old = int(previous_grid[int(rr), int(cc)])
             direct_empty_by_color[old] += 1
 
-    expected, remaining, excess = _capacity_audit_only(
+    (
+        expected,
+        remaining,
+        excess,
+        occluded_explained,
+    ) = _capacity_audit_with_occluded_unknown(
         consumed_by_color,
         visual_removed,
+        occluded_ui_temporal_empty,
     )
+    if occluded_explained:
+        warnings.append(
+            "capacity_remaining_explained_by_occluded_ui="
+            + ",".join(
+                f"{ctag(c)}:{n}"
+                for c, n in sorted(occluded_explained.items())
+            )
+        )
     if remaining:
         reasons.append(
             "capacity_remaining="
@@ -1587,8 +1738,14 @@ def observe_board(
         current_empty_cells=int(np.count_nonzero(final_grid == EMPTY)),
         current_unknown_cells=unknown_cells,
         history_resolved_cells=int(history_resolved),
-        temporal_resolved_empty_cells=int(sum(temporal_empty_by_color.values())),
-        removed_cells=int(sum(visual_removed.values())),
+        temporal_resolved_empty_cells=int(
+            sum(temporal_empty_by_color.values())
+            + occluded_ui_temporal_empty
+        ),
+        removed_cells=int(
+            sum(visual_removed.values())
+            + occluded_ui_temporal_empty
+        ),
         visual_removed_by_color=visual_removed,
         direct_empty_by_color=dict(sorted(direct_empty_by_color.items())),
         temporal_empty_by_color=temporal_empty_by_color,
